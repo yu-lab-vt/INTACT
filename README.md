@@ -35,7 +35,7 @@ The main function is `tracklets_integration` from the `integ` module. Below are 
 | `spatial_shift`  | Translation offsets needed to bring the two blocks into a common coordinate system. Format: `[[z_off1, y_off1, x_off1], [z_off2, y_off2, x_off2]]` (or 2D equivalent). For temporal integration this is typically `[[0,0,0],[0,0,0]]` and can be omitted.                                                                                                                |
 | `temporal_shift` | Frame offsets needed to align the temporal axes. Format: `[shift1, shift2]`. For spatial integration this is typically `[0,0]` and can be omitted.                                                                                                                                                                                                                     |
 | `mode`           | Integration mode:<br>- `'temporal'`: temporal integration (batches overlapping in time).<br>- `'spatial'`: spatial integration or multi‑view stitching (chunks overlapping in space).<br>- `'simple'`: simple fusion of two results that are already in the same coordinate system (both spatially and temporally).                                                 |
-| `solver`         | Optimization solver to use. Options: `'pulp'`, `'ortools'`, `'gurobi'`, `'bb'`. Note that `'gurobi'` requires a valid license.                                                                                                                                                                                                                                         |
+| `solver`         | Optimization solver to use. Options: `'pulp'`, `'gurobi'`, `'bb'`. Note that `'gurobi'` requires a valid license.                                                                                                                                                                                                                                         |
 | `saveSeg`        | Boolean. If `True`, the output CSV will include the `voxIdx` column (segmentation indices).                                                                                                                                                                                                           |
 
 ### CSV Format Requirements
@@ -53,5 +53,4 @@ The input CSV files **must** contain the following columns:
 - NumPy
 - pandas
 - PuLP (optional, if using `pulp` solver)
-- ortools (optional, if using `ortools` solver)
 - gurobipy (optional, if using `gurobi` solver)
