@@ -1182,9 +1182,9 @@ def edt_3d(ref_cell, mov_cell, shift):
     output = np.zeros(mov_cell.shape, dtype=np.float32)
     lib.edt_3d(
         ref_cell,
-        ref_dims,2,
+        ref_dims,3,
         mov_cell,
-        mov_dims,2,
+        mov_dims,3,
         shift,
         output
     )
@@ -1433,6 +1433,7 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
         else:
             new_parents.append(p)
     movieInfo_new['parents'] = new_parents
+
 
 
     return movieInfo_new
