@@ -1227,7 +1227,8 @@ def ovDistanceRegion(curRegVox: np.ndarray, nextRegVox: np.ndarray,
             frame_shift = np.array([0, 0])
         else:
             frame_shift = np.array([])
-
+    if curRegVox.shape[1] == 2:
+        ovFlag = True
     if not ovFlag:
         # After downsampling, we can use this method to calculate distance
         if nextRegVox.shape[0] < 2 or curRegVox.shape[0] < 2:
@@ -1345,11 +1346,12 @@ def edt_3d(ref_cell, mov_cell, shift):
     output = np.zeros(mov_cell.shape, dtype=np.float32)
     lib.edt_3d(
         ref_cell,
-        ref_dims,2,
+        ref_dims,3,
         mov_cell,
-        mov_dims,2,
+        mov_dims,3,
         shift,
         output
     )
     # output = output.transpose(2, 0, 1)  # yxz -> zyx
+
     return output
