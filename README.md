@@ -13,7 +13,7 @@ INTACT supports three main integration scenarios:
 ## Environment
 
 ```bash
-conda create -n myenv python numpy pandas scipy pulp gurobipy -c conda-forge -y
+conda create -n INTACT python numpy pandas scipy pulp gurobipy -c conda-forge -y
 ```
 
 ## Usage
@@ -52,5 +52,6 @@ The input CSV files **must** contain the following columns:
 - Python 3.7+
 - NumPy
 - pandas
+- scipy
 - PuLP (optional, if using `pulp` solver)
 - gurobipy (optional, if using `gurobi` solver)
