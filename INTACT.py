@@ -2,15 +2,12 @@ import numpy as np
 import pandas as pd
 import branchbound as bb
 import ilp
-import copy
 import os
 from typing import Dict, List, Tuple, Any, Set, Optional
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import csv
-import tifffile
 import time
-import warnings
 import pickle
 import pulp
 
