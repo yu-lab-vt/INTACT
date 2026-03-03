@@ -3,7 +3,6 @@ import pandas as pd
 import copy
 import os
 from typing import Dict, List, Tuple, Any, Set, Optional
-import json
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import ctypes
@@ -1438,4 +1437,5 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
 
 
     return movieInfo_new
+
 
