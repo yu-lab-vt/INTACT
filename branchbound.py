@@ -1061,7 +1061,8 @@ def ovDistanceRegion(curRegVox: np.ndarray, nextRegVox: np.ndarray,
             frame_shift = np.array([0, 0])
         else:
             frame_shift = np.array([])
-
+    if curRegVox.shape[1] == 2:
+        ovFlag = True
     if not ovFlag:
         # After downsampling, we can use this method to calculate distance
         if nextRegVox.shape[0] < 2 or curRegVox.shape[0] < 2:
@@ -1437,3 +1438,4 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
 
 
     return movieInfo_new
+
