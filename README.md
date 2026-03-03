@@ -10,10 +10,10 @@ INTACT supports three main integration scenarios:
 2. **Spatial Integration** – Fuse trajectory sets from overlapping spatial regions. This minimizes loss of tracking accuracy caused by cells at region boundaries and ensures seamless trajectories across the whole field of view.
 3. **Multi‑view Stitching** – Fuse tracking results obtained from different views.
 
-## Installation
+## Environment
 
 ```bash
-pip install intact
+conda create -n myenv python numpy pandas scipy pulp gurobipy -c conda-forge -y
 ```
 
 ## Usage
