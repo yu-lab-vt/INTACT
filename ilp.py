@@ -1288,7 +1288,7 @@ def ovDistanceRegion(curRegVox: np.ndarray, nextRegVox: np.ndarray,
         intersection = cur_set.intersection(next_set)
         
         overlap_ratio = len(intersection) / (len(cur_set) + len(next_set) - len(intersection))
-        distances = -np.log(overlap_ratio) if overlap_ratio > 0 else np.inf
+        distances = -np.log(overlap_ratio) if overlap_ratio > 0 else 1e4
         distances = [distances,distances]
         re_ratio = overlap_ratio
     maxDistance = np.max(distances)
@@ -1355,3 +1355,4 @@ def edt_3d(ref_cell, mov_cell, shift):
     # output = output.transpose(2, 0, 1)  # yxz -> zyx
 
     return output
+
