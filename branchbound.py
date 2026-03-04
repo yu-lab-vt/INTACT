@@ -1121,7 +1121,7 @@ def ovDistanceRegion(curRegVox: np.ndarray, nextRegVox: np.ndarray,
         intersection = cur_set.intersection(next_set)
         
         overlap_ratio = len(intersection) / (len(cur_set) + len(next_set) - len(intersection))
-        distances = -np.log(overlap_ratio) if overlap_ratio > 0 else np.inf
+        distances = -np.log(overlap_ratio) if overlap_ratio > 0 else 1e4
         distances = [distances,distances]
         re_ratio = overlap_ratio
     maxDistance = np.max(distances)
@@ -1437,5 +1437,6 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
 
 
     return movieInfo_new
+
 
 
