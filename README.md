@@ -13,7 +13,10 @@ INTACT supports three main integration scenarios:
 ## Environment
 
 ```bash
-conda create -n INTACT python numpy pandas scipy pulp gurobipy -c conda-forge -y
+conda create -n INTACT python numpy pandas scipy pulp -c conda-forge -y
+conda activate INTACT
+pip install gurobipy   # if gurobi is used
+# Warning: Gurobi requires a commercial license to run (free academic licenses are available)
 ```
 
 ## Usage
