@@ -2,54 +2,229 @@ import numpy as np
 import pandas as pd
 import copy
 import os
-from typing import Dict, List, Tuple, Any, Set, Optional
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import ctypes
-from scipy import stats
 import warnings
-from collections import deque, defaultdict
 import heapq
-import ctypes
+
+from typing import Dict, List, Tuple, Any, Set, Optional
+from collections import deque, defaultdict, Counter
+
+from scipy import stats
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_C_PACKAGE_DIR = os.path.join(_THIS_DIR, "C_package")
+if _C_PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, _C_PACKAGE_DIR)
+
+from fast_subgraphs import build_subgraphs_cpp
+
+# C++ only builds easy-subgraph arcs/costs.
+# We intentionally keep Python mcc4mot for solving, because C++ run_cinda_cpp
+# was observed to be inconsistent with Python mcc4mot on the same arcs.
+try:
+    from fast_easy_fusion_wrapper import build_easy_arcs_cpp_wrapper
+except ImportError:
+    # Backward-compatible name used during debugging.
+    from fast_easy_fusion_wrapper import build_easy_arcs_debug_cpp_wrapper as build_easy_arcs_cpp_wrapper
+
+
+_EDT3D_LIB = None
+_CINDA_LIB = None
+
+
+def get_edt3d_lib():
+    global _EDT3D_LIB
+
+    if _EDT3D_LIB is not None:
+        return _EDT3D_LIB
+
+    if sys.platform == "win32":
+        lib_path = os.path.join(_C_PACKAGE_DIR, "edt_3d.dll")
+    else:
+        lib_path = os.path.join(_C_PACKAGE_DIR, "libedt3d.so")
+
+    lib = ctypes.CDLL(lib_path)
+
+    lib.edt_3d.argtypes = [
+        np.ctypeslib.ndpointer(dtype=np.uint8, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        np.ctypeslib.ndpointer(dtype=np.uint8, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+        ctypes.c_int,
+        np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),
+        np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),
+    ]
+    lib.edt_3d.restype = None
+
+    _EDT3D_LIB = lib
+    return _EDT3D_LIB
+
+
+def get_cinda_lib():
+    global _CINDA_LIB
+
+    if _CINDA_LIB is not None:
+        return _CINDA_LIB
+
+    if sys.platform == "win32":
+        lib_path = os.path.join(_C_PACKAGE_DIR, "lib_cinda_funcs.dll")
+    else:
+        lib_path = os.path.join(_C_PACKAGE_DIR, "lib_cinda_funcs.so")
+
+    lib = ctypes.CDLL(lib_path)
+
+    lib.pyCS2.argtypes = (
+        ctypes.POINTER(ctypes.c_long),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+    )
+    lib.pyCS2.restype = ctypes.POINTER(ctypes.c_longlong)
+
+    _CINDA_LIB = lib
+    return _CINDA_LIB
+
+def normalize_tracks(tracks):
+    return sorted([
+        tuple(map(int, t))
+        for t in tracks
+        if len(t) > 0
+    ])
+
+def normalize_subgraphs(subgraphs):
+    return sorted([tuple(sorted(map(int, sg))) for sg in subgraphs])
+
+def pack_voxels(movieInfo1_partial, movieInfo2_partial):
+    vox_all = list(movieInfo1_partial["vox"]) + list(movieInfo2_partial["vox"])
+    if len(vox_all) == 0:
+        raise ValueError("No voxels found.")
+
+    dim = int(np.asarray(vox_all[0]).shape[1])
+    lengths = np.asarray([len(v) for v in vox_all], dtype=np.int64)
+
+    offsets = np.empty(len(vox_all) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+
+    vox_flat = np.empty((int(offsets[-1]), dim), dtype=np.int32)
+    pos = 0
+    for v in vox_all:
+        v = np.asarray(v, dtype=np.int32)
+        if v.ndim != 2 or v.shape[1] != dim:
+            raise ValueError("All vox arrays must have the same dimension.")
+        n = len(v)
+        vox_flat[pos:pos+n] = v
+        pos += n
+
+    return np.ascontiguousarray(vox_flat), np.ascontiguousarray(offsets), dim
+
+def normalize_edges(edges):
+    return [sorted(set(map(int, e))) for e in edges]
 
 def solve_fusion(movieInfo1_partial, movieInfo2_partial, matches):
     """
-    Efficient pre-pruning for very large graphs.
-    Build joint graph, extract connected components,
-    and classify easy vs hard subgraphs.
+    Fusion solver, stable accelerated version.
 
-    This function also builds detection_arcs and transition_arcs for easy subgraphs
-    and uses the mcc4mot function to solve the problem.
+    Current design
+    --------------
+    Step 4-1 + Step 4-2a:
+        C++ builds easy-subgraph detection_arcs / transition_arcs and computes
+        transition costs.
+    Step 4-2b:
+        Python mcc4mot solves the easy-subgraph min-cost circulation.
+    Step 4-3:
+        Python branch-and-bound solves hard subgraphs.
 
-    Returns
-    -------
-    selected_cells : list of tuples
-        Each tuple contains (cell_id, parent_id) for selected cells.
+    Rationale
+    ---------
+    We do not call the full C++ easy solver here because C++ run_cinda_cpp was
+    observed to give a different result from Python mcc4mot on the same arcs.
+    This hybrid path preserves the main acceleration while keeping the solver
+    behavior stable.
     """
-    print("\nStep 4-1: Building subgraphs...")
-    easy_subgraphs, hard_subgraphs, edges = build_subgraphs(movieInfo1_partial, movieInfo2_partial, matches)
-    
-    print("\nStep 4-2: Solving easy subgraphs...")
-    # pruning and solve easy subgraphs
-    tracks_easy,_ = pruning(easy_subgraphs, movieInfo1_partial, movieInfo2_partial, edges)
-    matches_arr = np.array(matches)
-    matches_arr[:,1] = matches_arr[:,1] + len(movieInfo1_partial['frames'])
-    matching_rows = [i for i, row in enumerate(matches_arr) 
-                if all(idx in np.concatenate(tracks_easy) for idx in row)]
+    n1 = len(movieInfo1_partial["frames"])
+    n2 = len(movieInfo2_partial["frames"])
+    N = n1 + n2
+
+    ########################################################################################################################
+    print("\nStep 4-1 + Step 4-2a: Building easy arcs with C++...")
+    detection_arcs, transition_arcs, _easy_subgraphs_cpp, hard_subgraphs, edges = (
+        build_easy_arcs_cpp_wrapper(
+            movieInfo1_partial,
+            movieInfo2_partial,
+            matches,
+        )
+    )
+
+    detection_arcs = np.ascontiguousarray(detection_arcs, dtype=np.float64)
+    transition_arcs = np.ascontiguousarray(transition_arcs, dtype=np.float64)
+
+    print("\nStep 4-2b: Solving easy subgraphs with Python mcc4mot...")
+    trajectories, costs = mcc4mot(detection_arcs, transition_arcs)
+
+    tracks_easy = []
+    for track in trajectories:
+        track = np.asarray(track, dtype=int)
+        track = track[track < N]  # remove pseudo/control nodes
+        if len(track) > 0:
+            tracks_easy.append(track)
+
+    # Convert matches to merged/global node indexing.
+    matches_arr = np.asarray(matches, dtype=np.int64).copy()
+    if matches_arr.size == 0:
+        matches_arr = np.empty((0, 2), dtype=np.int64)
+    else:
+        if matches_arr.ndim != 2 or matches_arr.shape[1] < 2:
+            raise ValueError(f"matches must have shape (M, >=2), got {matches_arr.shape}")
+        matches_arr = matches_arr[:, :2].copy()
+        matches_arr[:, 1] += n1
+
+    # Optional sanity check: if both endpoints of a matched pair are already
+    # selected by easy subgraphs, warn the user. This preserves your previous
+    # check but avoids repeated np.concatenate inside the loop.
+    if len(tracks_easy) > 0:
+        selected_easy = set(np.concatenate(tracks_easy).astype(int).tolist())
+    else:
+        selected_easy = set()
+
+    matching_rows = [
+        i
+        for i, row in enumerate(matches_arr)
+        if int(row[0]) in selected_easy and int(row[1]) in selected_easy
+    ]
     if len(matching_rows) > 0:
-        warnings.warn(f"Warning: Some matches are included in easy subgraphs. Rows: {matching_rows}")
-    
+        warnings.warn(
+            f"Warning: Some matches are included in easy subgraphs. Rows: {matching_rows}"
+        )
+
+    ########################################################################################################################
     print("\nStep 4-3: Solving hard subgraphs...")
     tracks_hard = []
 
     for subgraph_nodes in hard_subgraphs:
-        current_ids = set(subgraph_nodes)
-        mask = np.isin(matches_arr[:, 0], list(current_ids))
-        matches_hard = matches_arr[mask]
-        subtracks_hard = solve_hard_fusion(current_ids, movieInfo1_partial, movieInfo2_partial, matches_hard, edges)
-        tracks_hard.extend(subtracks_hard)
-    final_tracks = tracks_easy + tracks_hard
+        current_ids = set(map(int, subgraph_nodes))
+        if len(matches_arr) == 0:
+            matches_hard = np.empty((0, 2), dtype=np.int64)
+        else:
+            # Keep original filtering behavior: matches whose first endpoint is
+            # inside this hard subgraph.
+            mask = np.isin(matches_arr[:, 0], list(current_ids))
+            matches_hard = matches_arr[mask]
 
+        subtracks_hard = solve_hard_fusion(
+            current_ids,
+            movieInfo1_partial,
+            movieInfo2_partial,
+            matches_hard,
+            edges,
+        )
+        tracks_hard.extend(subtracks_hard)
+
+    final_tracks = tracks_easy + tracks_hard
     return final_tracks
 
 def build_subgraphs(movieInfo1_partial, movieInfo2_partial, matches):
@@ -746,17 +921,22 @@ def solve_flow_node(node, matches_hard, node_in_id=None, node_out_id=None):
     """
     Solve min-cost flow and detect violations.
     """
-
     try:
         trajectories, cost = mcc4mot(node["detection"], node["transition"])
-    except Exception:
-        return float("inf"), None, float("inf"), []
+    except Exception as e:
+        warnings.warn(f"mcc4mot failed in solve_flow_node: {e}")
+        return None, float("inf"), []
 
     if trajectories is None:
-        return float("inf"), None, float("inf"), []
+        return None, float("inf"), []
 
-    violations = find_violations(trajectories, matches_hard, node_in_id, node_out_id)
-    
+    violations = find_violations(
+        trajectories,
+        matches_hard,
+        node_in_id,
+        node_out_id,
+    )
+
     return trajectories, np.sum(cost), violations
 
 def initialize_correction_data(transition_arcs, matches_hard, node_in, node_out, threshold):
@@ -929,61 +1109,74 @@ def find_violations(trajectories, matches_hard, node_in_id, node_out_id):
     return violations
 
 def mcc4mot(detection_arcs, transition_arcs):
-    # The min-cost circulation formulation of MAP solver for multi-object
-    # tracking.
-    # INPUT: 
-    # Assuming we have n detections in the video, then
-    # detection_arcs: a n x 4 matrix, each row corresponds to a detection in the
-    # form of [detection_id, C_i, C_i^en, C_i^ex];
-    # transition_arcs: a m x 3 matrix, each row corresponds to a transition arc
-    # in the form of [detection_id_i, detection_id_j, C_i,j]
-    # NOTE that the id should be unique and in the range of 1 to n. Detailed 
-    # defintion can be found in section 3 of the reference:
+    """
+    Python wrapper of pyCS2 min-cost circulation solver.
 
-    # OUTPUT:
-    # traj: cells containing the linking results; each cell contains a
-    # set of ordered detection ids, which indicate a trajectory
-    # cost: costs of these trajectories
-    detection_arcs_tem = detection_arcs.copy()
-    transition_arcs_tem = transition_arcs.copy()
-    detection_arcs_tem[:,0] = detection_arcs_tem[:,0] + 1
-    transition_arcs_tem[:,:2] = transition_arcs_tem[:,:2] + 1
-    if sys.platform == 'win32':
-        _cinda = ctypes.CDLL(os.path.join('C_package', 'lib_cinda_funcs.dll'))
-    else:
-        _cinda = ctypes.CDLL(os.path.join('C_package', 'lib_cinda_funcs.so'))
-    _cinda.pyCS2.argtypes = (ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double))
-    _cinda.pyCS2.restype = ctypes.POINTER(ctypes.c_longlong)
+    Input
+    -----
+    detection_arcs : ndarray, shape (n, 4)
+        [detection_id, C_i, C_i_en, C_i_ex]
+    transition_arcs : ndarray, shape (m, 3)
+        [src_id, dst_id, C_ij]
 
-    mtail, mhead, mlow, macap, mcost, msz = cinda_data_process(detection_arcs_tem, transition_arcs_tem)
+    Return
+    ------
+    traj : list[np.ndarray]
+    cost : list[float]
+    """
+    detection_arcs_tem = np.ascontiguousarray(detection_arcs, dtype=np.float64).copy()
+    transition_arcs_tem = np.ascontiguousarray(transition_arcs, dtype=np.float64).copy()
+
+    if detection_arcs_tem.ndim != 2 or detection_arcs_tem.shape[1] != 4:
+        raise ValueError(f"detection_arcs must have shape (n, 4), got {detection_arcs_tem.shape}")
+
+    if transition_arcs_tem.ndim != 2 or transition_arcs_tem.shape[1] != 3:
+        raise ValueError(f"transition_arcs must have shape (m, 3), got {transition_arcs_tem.shape}")
+
+    # Convert 0-based Python ids to 1-based ids expected by cinda_data_process.
+    detection_arcs_tem[:, 0] += 1
+    transition_arcs_tem[:, :2] += 1
+
+    _cinda = get_cinda_lib()
+
+    mtail, mhead, mlow, macap, mcost, msz = cinda_data_process(
+        detection_arcs_tem,
+        transition_arcs_tem,
+    )
+
     it_flag = False
-    if isinstance(mcost[0], float):
+    if len(mcost) > 0 and isinstance(mcost[0], float):
         mcost = [int(n * 10**7) for n in mcost]
         it_flag = True
-    
+
     inf_type = ctypes.c_long * msz[0]
     a_type = ctypes.c_double * msz[2]
 
-    track_vec = _cinda.pyCS2(inf_type(*msz), a_type(*mtail), a_type(*mhead), a_type(*mlow), a_type(*macap), a_type(*mcost))
+    track_vec = _cinda.pyCS2(
+        inf_type(*msz),
+        a_type(*mtail),
+        a_type(*mhead),
+        a_type(*mlow),
+        a_type(*macap),
+        a_type(*mcost),
+    )
 
     cost = []
     traj = []
     sub_traj = []
-    #print trac_vec[0]
-    # print(track_vec[10])
-    for i in range(1, track_vec[0]+1):
-        # print(i, track_vec[i])
-        if  track_vec[i] > 0:
+
+    for i in range(1, track_vec[0] + 1):
+        if track_vec[i] > 0:
             sub_traj.append(track_vec[i])
         else:
             cost.append(track_vec[i])
-            # print(cost)
-            new = [int(x/2) for x in sub_traj[::2]]
-            traj.append(np.array(new)-1)
+            new = [int(x / 2) for x in sub_traj[::2]]
+            traj.append(np.array(new) - 1)
             sub_traj = []
-    
+
     if it_flag:
         cost = [(float(n) / 10**7) for n in cost]
+
     return traj, cost
 
 def cinda_data_process(detection_arcs, transition_arcs):
@@ -1156,30 +1349,9 @@ def edt_3d(ref_cell, mov_cell, shift):
     
     ref_dims = np.array(ref_cell.shape, dtype=np.int32)
     mov_dims = np.array(mov_cell.shape, dtype=np.int32)
-    
-    
-    if sys.platform == 'win32':
-        lib = ctypes.CDLL(os.path.join('C_package', 'edt_3d.dll'))
-    else:
-        lib = ctypes.CDLL(os.path.join('C_package', 'libedt3d.so'))
-
-    lib.edt_3d.argtypes = [
-        np.ctypeslib.ndpointer(dtype=np.uint8, flags='C_CONTIGUOUS'),  # ref_cell
-        np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'),  # ref_dims
-        ctypes.c_int,
-        np.ctypeslib.ndpointer(dtype=np.uint8, flags='C_CONTIGUOUS'),  # mov_cell
-        np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'),  # mov_dims
-        ctypes.c_int,
-        np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS'), # shift
-        np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS')  # output
-    ]
-    lib.edt_3d.restype = None
-    # ref_cell = ref_cell.transpose(1, 2, 0)  # zyx -> yxz
-    # mov_cell = mov_cell.transpose(1, 2, 0)  # zyx -> yxz
-    # ref_cell = np.ascontiguousarray(ref_cell)
-    # mov_cell = np.ascontiguousarray(mov_cell)
-    # shift = np.array([shift[1], shift[2], shift[0]], dtype=np.float32)
     output = np.zeros(mov_cell.shape, dtype=np.float32)
+
+    lib = get_edt3d_lib()
     lib.edt_3d(
         ref_cell,
         ref_dims,3,
@@ -1437,6 +1609,3 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
 
 
     return movieInfo_new
-
-
-

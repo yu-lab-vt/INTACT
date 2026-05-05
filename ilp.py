@@ -5,9 +5,9 @@ import os
 from typing import Dict, List, Tuple, Any, Set, Optional
 from scipy import stats
 import time
-import gurobipy as gp
-from gurobipy import GRB
-import pulp
+# import gurobipy as gp
+# from gurobipy import GRB
+# import pulp
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import ctypes

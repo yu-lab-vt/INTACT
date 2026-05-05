@@ -9,7 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import csv
 import time
 import pickle
-import pulp
+# import pulp
+
+
 
 def tracklets_integration(
     csv_path1: str,
