@@ -2,51 +2,55 @@ import numpy as np
 import pandas as pd
 import copy
 import os
-import sys
-import ctypes
-import warnings
-import heapq
-
 from typing import Dict, List, Tuple, Any, Set, Optional
-from collections import deque, defaultdict, Counter
-
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
+import ctypes
 from scipy import stats
+import warnings
+from collections import deque, defaultdict
+import heapq
+import ctypes
+from itertools import product
+try:
+    from C_package.fast_full_fusion_wrapper import solve_fusion_cpp_wrapper
+except Exception:
+    solve_fusion_cpp_wrapper = None
+import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _C_PACKAGE_DIR = os.path.join(_THIS_DIR, "C_package")
 if _C_PACKAGE_DIR not in sys.path:
     sys.path.insert(0, _C_PACKAGE_DIR)
 
-from fast_subgraphs import build_subgraphs_cpp
-
-# C++ only builds easy-subgraph arcs/costs.
-# We intentionally keep Python mcc4mot for solving, because C++ run_cinda_cpp
-# was observed to be inconsistent with Python mcc4mot on the same arcs.
+# from fast_subgraphs import build_subgraphs_cpp
 try:
-    from fast_easy_fusion_wrapper import build_easy_arcs_cpp_wrapper
+    from C_package.fast_easy_fusion_wrapper import build_easy_arcs_cpp_wrapper
 except ImportError:
     # Backward-compatible name used during debugging.
-    from fast_easy_fusion_wrapper import build_easy_arcs_debug_cpp_wrapper as build_easy_arcs_cpp_wrapper
+    from C_package.fast_easy_fusion_wrapper import build_easy_arcs_debug_cpp_wrapper as build_easy_arcs_cpp_wrapper
 
+# =========================
+# Global C solver loader
+# =========================
 
-_EDT3D_LIB = None
-_CINDA_LIB = None
-
+_CINDA = None
+_EDT3D = None
 
 def get_edt3d_lib():
-    global _EDT3D_LIB
+    global _EDT3D
 
-    if _EDT3D_LIB is not None:
-        return _EDT3D_LIB
+    if _EDT3D is not None:
+        return _EDT3D
 
     if sys.platform == "win32":
         lib_path = os.path.join(_C_PACKAGE_DIR, "edt_3d.dll")
     else:
         lib_path = os.path.join(_C_PACKAGE_DIR, "libedt3d.so")
 
-    lib = ctypes.CDLL(lib_path)
+    _EDT3D = ctypes.CDLL(lib_path)
 
-    lib.edt_3d.argtypes = [
+    _EDT3D.edt_3d.argtypes = [
         np.ctypeslib.ndpointer(dtype=np.uint8, flags="C_CONTIGUOUS"),
         np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
         ctypes.c_int,
@@ -56,26 +60,24 @@ def get_edt3d_lib():
         np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),
         np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS"),
     ]
-    lib.edt_3d.restype = None
+    _EDT3D.edt_3d.restype = None
 
-    _EDT3D_LIB = lib
-    return _EDT3D_LIB
+    return _EDT3D
 
+def get_cinda_solver():
+    global _CINDA
 
-def get_cinda_lib():
-    global _CINDA_LIB
+    if _CINDA is not None:
+        return _CINDA
 
-    if _CINDA_LIB is not None:
-        return _CINDA_LIB
-
-    if sys.platform == "win32":
-        lib_path = os.path.join(_C_PACKAGE_DIR, "lib_cinda_funcs.dll")
+    if sys.platform == 'win32':
+        lib_path = os.path.join('C_package', 'lib_cinda_funcs.dll')
     else:
-        lib_path = os.path.join(_C_PACKAGE_DIR, "lib_cinda_funcs.so")
+        lib_path = os.path.join('C_package', 'lib_cinda_funcs.so')
 
-    lib = ctypes.CDLL(lib_path)
+    _CINDA = ctypes.CDLL(lib_path)
 
-    lib.pyCS2.argtypes = (
+    _CINDA.pyCS2.argtypes = (
         ctypes.POINTER(ctypes.c_long),
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
@@ -83,76 +85,44 @@ def get_cinda_lib():
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
     )
-    lib.pyCS2.restype = ctypes.POINTER(ctypes.c_longlong)
+    _CINDA.pyCS2.restype = ctypes.POINTER(ctypes.c_longlong)
 
-    _CINDA_LIB = lib
-    return _CINDA_LIB
+    return _CINDA
 
-def normalize_tracks(tracks):
-    return sorted([
-        tuple(map(int, t))
-        for t in tracks
-        if len(t) > 0
-    ])
+def solve_fusion_v2(movieInfo1_partial, movieInfo2_partial, matches, return_stats=False):
+    if solve_fusion_cpp_wrapper is not None:
+        tracks, summary, hard_stats = solve_fusion_cpp_wrapper(
+            movieInfo1_partial,
+            movieInfo2_partial,
+            matches,
+            max_bb_nodes=1000000,
+            batch_branch_size=2,
+            use_initial_greedy=True,
+            use_conflict_blocks=True,
+            conflict_blocks_star_only=True,
+        )
 
-def normalize_subgraphs(subgraphs):
-    return sorted([tuple(sorted(map(int, sg))) for sg in subgraphs])
+        print_fusion_stats_table(summary, hard_stats)
 
-def pack_voxels(movieInfo1_partial, movieInfo2_partial):
-    vox_all = list(movieInfo1_partial["vox"]) + list(movieInfo2_partial["vox"])
-    if len(vox_all) == 0:
-        raise ValueError("No voxels found.")
+        if return_stats:
+            return tracks, summary, hard_stats
 
-    dim = int(np.asarray(vox_all[0]).shape[1])
-    lengths = np.asarray([len(v) for v in vox_all], dtype=np.int64)
+        return tracks
 
-    offsets = np.empty(len(vox_all) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(lengths, out=offsets[1:])
 
-    vox_flat = np.empty((int(offsets[-1]), dim), dtype=np.int32)
-    pos = 0
-    for v in vox_all:
-        v = np.asarray(v, dtype=np.int32)
-        if v.ndim != 2 or v.shape[1] != dim:
-            raise ValueError("All vox arrays must have the same dimension.")
-        n = len(v)
-        vox_flat[pos:pos+n] = v
-        pos += n
-
-    return np.ascontiguousarray(vox_flat), np.ascontiguousarray(offsets), dim
-
-def normalize_edges(edges):
-    return [sorted(set(map(int, e))) for e in edges]
-
-def solve_fusion(movieInfo1_partial, movieInfo2_partial, matches):
+def solve_fusion(movieInfo1_partial, movieInfo2_partial, matches, return_stats=False):
     """
-    Fusion solver, stable accelerated version.
+    Build subgraphs, solve easy subgraphs and hard subgraphs.
 
-    Current design
-    --------------
-    Step 4-1 + Step 4-2a:
-        C++ builds easy-subgraph detection_arcs / transition_arcs and computes
-        transition costs.
-    Step 4-2b:
-        Python mcc4mot solves the easy-subgraph min-cost circulation.
-    Step 4-3:
-        Python branch-and-bound solves hard subgraphs.
-
-    Rationale
-    ---------
-    We do not call the full C++ easy solver here because C++ run_cinda_cpp was
-    observed to give a different result from Python mcc4mot on the same arcs.
-    This hybrid path preserves the main acceleration while keeping the solver
-    behavior stable.
+    If return_stats=True, also return compact statistics.
     """
+    t_total = time.perf_counter()
+
+    print("\nStep 4-1 + Step 4-2a: Building easy arcs with C++...")
     n1 = len(movieInfo1_partial["frames"])
     n2 = len(movieInfo2_partial["frames"])
     N = n1 + n2
-
-    ########################################################################################################################
-    print("\nStep 4-1 + Step 4-2a: Building easy arcs with C++...")
-    detection_arcs, transition_arcs, _easy_subgraphs_cpp, hard_subgraphs, edges = (
+    detection_arcs, transition_arcs, easy_subgraphs, hard_subgraphs, edges = (
         build_easy_arcs_cpp_wrapper(
             movieInfo1_partial,
             movieInfo2_partial,
@@ -160,8 +130,18 @@ def solve_fusion(movieInfo1_partial, movieInfo2_partial, matches):
         )
     )
 
+    easy_total_nodes = int(sum(len(g) for g in easy_subgraphs))
+    hard_node_sizes = [int(len(g)) for g in hard_subgraphs]
+
     detection_arcs = np.ascontiguousarray(detection_arcs, dtype=np.float64)
     transition_arcs = np.ascontiguousarray(transition_arcs, dtype=np.float64)
+
+    transition_arcs = recompute_2d_transition_costs_by_edt(
+        transition_arcs=transition_arcs,
+        movieInfo1_partial=movieInfo1_partial,
+        movieInfo2_partial=movieInfo2_partial,
+        verbose=True,
+    )
 
     print("\nStep 4-2b: Solving easy subgraphs with Python mcc4mot...")
     trajectories, costs = mcc4mot(detection_arcs, transition_arcs)
@@ -201,30 +181,45 @@ def solve_fusion(movieInfo1_partial, movieInfo2_partial, matches):
             f"Warning: Some matches are included in easy subgraphs. Rows: {matching_rows}"
         )
 
-    ########################################################################################################################
     print("\nStep 4-3: Solving hard subgraphs...")
     tracks_hard = []
+    hard_stats = []
 
-    for subgraph_nodes in hard_subgraphs:
-        current_ids = set(map(int, subgraph_nodes))
-        if len(matches_arr) == 0:
-            matches_hard = np.empty((0, 2), dtype=np.int64)
-        else:
-            # Keep original filtering behavior: matches whose first endpoint is
-            # inside this hard subgraph.
-            mask = np.isin(matches_arr[:, 0], list(current_ids))
-            matches_hard = matches_arr[mask]
+    for hard_id, subgraph_nodes in enumerate(hard_subgraphs):
+        current_ids = set(subgraph_nodes)
+        mask = np.isin(matches_arr[:, 0], list(current_ids))
+        matches_hard = matches_arr[mask]
 
-        subtracks_hard = solve_hard_fusion(
+        subtracks_hard, sub_stats = solve_hard_fusion(
             current_ids,
             movieInfo1_partial,
             movieInfo2_partial,
             matches_hard,
             edges,
+            print_block_summary=False,
+            hard_id = hard_id
         )
+
         tracks_hard.extend(subtracks_hard)
+        hard_stats.append(sub_stats)
 
     final_tracks = tracks_easy + tracks_hard
+
+    total_time = time.perf_counter() - t_total
+
+    summary = {
+        "total_step4_5_time_sec": float(total_time),
+        "num_easy_subgraphs": int(len(easy_subgraphs)),
+        "num_hard_subgraphs": int(len(hard_subgraphs)),
+        "easy_total_nodes": int(easy_total_nodes),
+        "hard_node_sizes": hard_node_sizes,
+    }
+
+    print_fusion_stats_table(summary, hard_stats)
+
+    if return_stats:
+        return final_tracks, summary, hard_stats
+
     return final_tracks
 
 def build_subgraphs(movieInfo1_partial, movieInfo2_partial, matches):
@@ -476,40 +471,700 @@ def pruning(subgraphs, movieInfo1_partial, movieInfo2_partial, edges):
     trajectories_filtered = [track[track < N] for track in trajectories]
     return trajectories_filtered, costs
 
+def find_feasible_solution_greedy(
+    root_sol,
+    root_violations,
+    matches_hard,
+    node_in,
+    node_out,
+    base_detection_arcs,
+    base_transition_arcs,
+    max_iter=100,
+    verbose=True,
+):
+    """
+    Find a feasible incumbent before exact B&B.
+
+    This is only used to improve the initial upper bound. The exact B&B still
+    runs afterwards, so global optimality is not affected.
+    """
+    if root_sol is None or root_violations is None:
+        return None, float("inf")
+
+    current_detection = base_detection_arcs.copy()
+    current_transition = base_transition_arcs.copy()
+    current_fixed = {}
+    current_sol = root_sol
+    current_violations = list(root_violations)
+
+    best_feasible_sol = None
+    best_feasible_cost = float("inf")
+    flow_calls = 0
+
+    if verbose:
+        print(f"[INIT-GREEDY] start: violations={len(current_violations)}")
+
+    for it in range(max_iter):
+        current_violations = [m for m in current_violations if m not in current_fixed]
+
+        if len(current_violations) == 0:
+            node = {
+                "fixed": current_fixed,
+                "detection": current_detection,
+                "transition": current_transition,
+            }
+            sol, cost, violations = solve_flow_node(node, matches_hard, node_in, node_out)
+            flow_calls += 1
+            if sol is not None and violations is not None and len(violations) == 0:
+                best_feasible_sol = sol
+                best_feasible_cost = cost
+            break
+
+        match_id = current_violations[0]
+        u, v = matches_hard[match_id][:2]
+        u = int(u)
+        v = int(v)
+
+        candidates = []
+        for choice in [0, 1]:
+            # choice=0: forbid v; choice=1: forbid u.
+            forbid_node = v if choice == 0 else u
+
+            cand_detection = current_detection.copy()
+            cand_transition = current_transition.copy()
+            cand_detection, cand_transition = apply_forbid(
+                cand_detection,
+                cand_transition,
+                forbid_node,
+                node_in,
+                node_out,
+            )
+
+            cand_fixed = dict(current_fixed)
+            cand_fixed[match_id] = choice
+
+            cand_node = {
+                "fixed": cand_fixed,
+                "detection": cand_detection,
+                "transition": cand_transition,
+            }
+            cand_sol, cand_cost, cand_violations = solve_flow_node(
+                cand_node,
+                matches_hard,
+                node_in,
+                node_out,
+            )
+            flow_calls += 1
+
+            if cand_sol is None or cand_violations is None:
+                continue
+
+            cand_violations = [m for m in cand_violations if m not in cand_fixed]
+            candidates.append(
+                (
+                    len(cand_violations),
+                    cand_cost,
+                    choice,
+                    cand_fixed,
+                    cand_detection,
+                    cand_transition,
+                    cand_sol,
+                    cand_violations,
+                )
+            )
+
+        if len(candidates) == 0:
+            break
+
+        # Prefer reducing violations; if tied, prefer lower cost.
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        (
+            remain_viol_count,
+            cand_cost,
+            choice,
+            current_fixed,
+            current_detection,
+            current_transition,
+            current_sol,
+            current_violations,
+        ) = candidates[0]
+
+        if remain_viol_count == 0:
+            best_feasible_sol = current_sol
+            best_feasible_cost = cand_cost
+            break
+
+    if verbose:
+        if best_feasible_sol is not None:
+            print(
+                f"[INIT-GREEDY] found feasible: "
+                f"cost={best_feasible_cost:.6f}, flow_calls={flow_calls}"
+            )
+        else:
+            print(f"[INIT-GREEDY] failed to find feasible, flow_calls={flow_calls}")
+
+    return best_feasible_sol, best_feasible_cost
+
+def select_batch_violations(violations, min_switch_cost, batch_size=2):
+    """
+    Fallback match-level branching.
+
+    This remains exact and is used when no safe conflict block covers the
+    current violated matches.
+    """
+    violations = list(violations)
+    if len(violations) == 0:
+        return []
+
+    batch_size = max(1, min(int(batch_size), len(violations)))
+    return sorted(
+        violations,
+        key=lambda m: min_switch_cost.get(m, 0.0),
+        reverse=True,
+    )[:batch_size]
+
+def generate_exact_batch_assignments(selected_matches):
+    """
+    Enumerate all 2^k assignments for selected matches.
+
+    choice=0 means forbid the second endpoint v.
+    choice=1 means forbid the first endpoint u.
+    """
+    selected_matches = list(selected_matches)
+    for bits in product([0, 1], repeat=len(selected_matches)):
+        yield {mid: choice for mid, choice in zip(selected_matches, bits)}
+
+def build_batch_child(node, assignment, matches_hard, node_in, node_out):
+    """
+    Build one fallback B&B child by applying a complete assignment for several
+    individual matches.
+    """
+    child_fixed = dict(node["fixed"])
+    child_detection = node["detection"].copy()
+    child_transition = node["transition"].copy()
+
+    forbid_nodes = []
+    for match_id, choice in assignment.items():
+        match_id = int(match_id)
+        choice = int(choice)
+
+        if match_id in child_fixed:
+            if child_fixed[match_id] != choice:
+                return None, None
+            continue
+
+        u, v = matches_hard[match_id][:2]
+        u = int(u)
+        v = int(v)
+        forbid_node = v if choice == 0 else u
+
+        child_fixed[match_id] = choice
+        forbid_nodes.append(forbid_node)
+
+    child_detection, child_transition = apply_forbid_many(
+        child_detection,
+        child_transition,
+        forbid_nodes,
+        node_in,
+        node_out,
+    )
+    if child_detection is None:
+        return None, None
+
+    child = {
+        "fixed": child_fixed,
+        "detection": child_detection,
+        "transition": child_transition,
+    }
+    child_key = tuple(sorted(child_fixed.items()))
+    child["depth"] = node.get("depth", 0) + 1
+    return child, child_key
+
+def _cell_side(cell_id, n1):
+    return 0 if int(cell_id) < n1 else 1
+
+def _cell_frame(cell_id, n1, frames1, frames2):
+    cell_id = int(cell_id)
+    if cell_id < n1:
+        return int(frames1[cell_id])
+    return int(frames2[cell_id - n1])
+
+def build_frame_conflict_blocks(
+    matches_hard,
+    movieInfo1_partial,
+    movieInfo2_partial,
+    star_only=True,
+):
+    """
+    Build same-frame bipartite conflict blocks from matches_hard.
+
+    A block is a connected component in the bipartite graph formed by matches
+    at the same frame.  For speed and safety, the default `star_only=True`
+    keeps only k-vs-1 or 1-vs-k blocks.  This exactly covers cases like:
+
+        {843, 893} vs {764}
+        {1558} vs {1478, 1584}
+
+    and avoids prematurely compressing general k-vs-m blocks, where mixed
+    selections might be meaningful in some datasets.
+
+    Returns
+    -------
+    conflict_blocks : list[dict]
+        Each block has keys: block_id, frame, left_nodes, right_nodes,
+        match_ids, kind.
+    match_to_block : dict[int, int]
+        Map from match_id to block_id.
+    """
+    matches_hard = np.asarray(matches_hard)
+    n1 = len(movieInfo1_partial["frames"])
+    frames1 = np.asarray(movieInfo1_partial["frames"], dtype=int)
+    frames2 = np.asarray(movieInfo2_partial["frames"], dtype=int)
+
+    # frame -> adjacency over original cell ids, using only same-frame matches.
+    frame_adj = defaultdict(lambda: defaultdict(set))
+    frame_match_ids = defaultdict(list)
+
+    for mid, row in enumerate(matches_hard):
+        u = int(row[0])
+        v = int(row[1])
+        fu = _cell_frame(u, n1, frames1, frames2)
+        fv = _cell_frame(v, n1, frames1, frames2)
+        if fu != fv:
+            # Keep cross-frame matches as normal match-level constraints.
+            continue
+        if _cell_side(u, n1) == _cell_side(v, n1):
+            # Not a cross-movie bipartite match; do not compress.
+            continue
+
+        f = fu
+        frame_adj[f][u].add(v)
+        frame_adj[f][v].add(u)
+        frame_match_ids[f].append(mid)
+
+    conflict_blocks = []
+    match_to_block = {}
+
+    # Helper map from unordered endpoint pair to match id.
+    pair_to_match = {}
+    for mid, row in enumerate(matches_hard):
+        u = int(row[0])
+        v = int(row[1])
+        pair_to_match[frozenset((u, v))] = mid
+
+    for f in sorted(frame_adj.keys()):
+        adj = frame_adj[f]
+        visited = set()
+
+        for start in list(adj.keys()):
+            if start in visited:
+                continue
+
+            q = deque([start])
+            visited.add(start)
+            comp_nodes = []
+
+            while q:
+                x = q.popleft()
+                comp_nodes.append(x)
+                for y in adj[x]:
+                    if y not in visited:
+                        visited.add(y)
+                        q.append(y)
+
+            if len(comp_nodes) < 2:
+                continue
+
+            left_nodes = sorted([x for x in comp_nodes if _cell_side(x, n1) == 0])
+            right_nodes = sorted([x for x in comp_nodes if _cell_side(x, n1) == 1])
+
+            if len(left_nodes) == 0 or len(right_nodes) == 0:
+                continue
+
+            block_match_ids = []
+            for u in left_nodes:
+                for v in right_nodes:
+                    mid = pair_to_match.get(frozenset((u, v)))
+                    if mid is not None:
+                        block_match_ids.append(int(mid))
+
+            block_match_ids = sorted(set(block_match_ids))
+            if len(block_match_ids) <= 1:
+                continue
+
+            # Default exact-safe compression: only k-vs-1 or 1-vs-k blocks.
+            if star_only and not (len(left_nodes) == 1 or len(right_nodes) == 1):
+                continue
+
+            block_id = len(conflict_blocks)
+            if len(left_nodes) == 1 and len(right_nodes) > 1:
+                kind = "1-vs-k"
+            elif len(left_nodes) > 1 and len(right_nodes) == 1:
+                kind = "k-vs-1"
+            else:
+                kind = "k-vs-m"
+
+            block = {
+                "block_id": block_id,
+                "frame": int(f),
+                "left_nodes": tuple(int(x) for x in left_nodes),
+                "right_nodes": tuple(int(x) for x in right_nodes),
+                "match_ids": tuple(int(x) for x in block_match_ids),
+                "kind": kind,
+            }
+            conflict_blocks.append(block)
+
+            for mid in block_match_ids:
+                match_to_block[int(mid)] = block_id
+
+    return conflict_blocks, match_to_block
+
+def count_root_conflict_units(root_violations, match_to_block):
+    """
+    Count conflict units.
+
+    If several violated matches belong to the same same-frame conflict block,
+    count them as one conflict unit.
+    Matches outside conflict blocks are counted individually.
+    """
+    used_blocks = set()
+    single_count = 0
+
+    for mid in root_violations:
+        mid = int(mid)
+        bid = match_to_block.get(mid)
+
+        if bid is None:
+            single_count += 1
+        else:
+            used_blocks.add(int(bid))
+
+    return len(used_blocks) + single_count
+
+def print_fusion_stats_table(summary, hard_stats):
+    """
+    Print compact final statistics table.
+    Also print:
+      1. hard_total_nodes
+      2. the row with the largest max_depth
+    """
+    print("\n" + "=" * 100)
+    print("Fusion Step 4&5 Statistics")
+    print("=" * 100)
+
+    print(
+        f"total_step4_5_time_sec: "
+        f"{summary.get('total_step4_5_time_sec', np.nan):.4f}"
+    )
+
+    rows = []
+    for s in hard_stats:
+        rows.append({
+            "hard_id": s.get("hard_id", -1),
+            "nodes": s.get("num_nodes", s.get("nodes", 0)),
+            "matches": s.get("num_matches", s.get("matches", 0)),
+            "root_satisfied_matches": s.get("root_satisfied_matches", 0),
+            "root_violated_matches": s.get("root_violated_matches", 0),
+            "max_depth": s.get("max_depth", 0),
+            "branches_explored": s.get("branches_explored", 0),
+            "flow_calls": s.get("flow_calls", 0),
+            "certified": s.get("certified_optimal", s.get("certified", False)),
+            "reason": s.get("termination_reason", s.get("reason", "")),
+            "time_flow_sec": s.get("time_solve_flow", s.get("time_flow_sec", 0.0)),
+        })
+
+    # 优先从 hard_stats 统计 hard_total_nodes；
+    # 如果 hard_stats 为空，则尝试从 summary["hard_node_sizes"] 中统计。
+    if len(rows) > 0:
+        hard_total_nodes = int(sum(int(r["nodes"]) for r in rows))
+    else:
+        hard_total_nodes = int(sum(summary.get("hard_node_sizes", [])))
+
+    print(
+        f"easy_subgraphs: {summary.get('num_easy_subgraphs', 0)}, "
+        f"hard_subgraphs: {summary.get('num_hard_subgraphs', 0)}, "
+        f"easy_total_nodes: {summary.get('easy_total_nodes', 0)}, "
+        f"hard_total_nodes: {hard_total_nodes}"
+    )
+
+    if len(rows) == 0:
+        print("No hard subgraphs.")
+        print("=" * 100)
+        return
+
+    df = pd.DataFrame(rows)
+
+    print("\n[HARD_STATS]")
+    print(df.to_string(index=False))
+
+    # 单独输出 max_depth 最大的那一行
+    # 如果有多个 hard subgraph 的 max_depth 相同，这里默认输出第一个。
+    max_depth_idx = df["max_depth"].astype(float).idxmax()
+    max_depth_row = df.loc[[max_depth_idx]]
+
+    print("\n[MAX_DEPTH_MAX_ROW]")
+    print(max_depth_row.to_string(index=False))
+
+    print("=" * 100)
+    
+def summarize_conflict_blocks(conflict_blocks, n1, max_print=20):
+    """Print a compact summary of conflict blocks used for B&B branching."""
+    print(
+        f"[BLOCKS] usable_same_frame_blocks={len(conflict_blocks)} "
+        f"(default: star blocks only)"
+    )
+    for block in conflict_blocks[:max_print]:
+        left_local = [int(x) for x in block["left_nodes"]]
+        right_local = [int(x) - n1 for x in block["right_nodes"]]
+        # print(
+        #     f"  block[{block['block_id']}] frame={block['frame']} "
+        #     f"kind={block['kind']} "
+        #     f"matches={list(block['match_ids'])} "
+        #     f"M1={left_local} vs M2={right_local}"
+        # )
+    if len(conflict_blocks) > max_print:
+        print(f"  ... {len(conflict_blocks) - max_print} more blocks not printed")
+
+def select_conflict_block(
+    violations,
+    fixed,
+    conflict_blocks,
+    match_to_block,
+    min_switch_cost,
+):
+    """
+    Select one unresolved conflict block for branching.
+
+    Preference:
+      1) covers many current violations;
+      2) has larger estimated correction impact;
+      3) contains more matches.
+    """
+    unresolved = [int(m) for m in violations if int(m) not in fixed]
+    if len(unresolved) == 0:
+        return None
+
+    candidate_block_ids = set()
+    for mid in unresolved:
+        bid = match_to_block.get(mid)
+        if bid is not None:
+            candidate_block_ids.add(int(bid))
+
+    if len(candidate_block_ids) == 0:
+        return None
+
+    unresolved_set = set(unresolved)
+    best_key = None
+    best_block = None
+
+    for bid in candidate_block_ids:
+        block = conflict_blocks[bid]
+        mids = list(block["match_ids"])
+        unresolved_in_block = [m for m in mids if m in unresolved_set]
+        if len(unresolved_in_block) == 0:
+            continue
+
+        impact = sum(max(float(min_switch_cost.get(m, 0.0)), 0.0) for m in unresolved_in_block)
+        key = (len(unresolved_in_block), impact, len(mids), -int(block["frame"]))
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best_block = block
+
+    return best_block
+
+def _assignment_for_forbid_node(match_id, forbid_node, matches_hard):
+    """
+    Convert a forbidden original node into the old match-level choice encoding.
+
+    choice=0 means forbid v.
+    choice=1 means forbid u.
+    """
+    u, v = matches_hard[int(match_id)][:2]
+    u = int(u)
+    v = int(v)
+    forbid_node = int(forbid_node)
+
+    if forbid_node == v:
+        return 0
+    if forbid_node == u:
+        return 1
+    return None
+
+def build_block_child(node, block, choose_side, matches_hard, node_in, node_out):
+    """
+    Build one B&B child from a conflict block.
+
+    choose_side=0: choose the left/M1 side, forbid all right/M2 nodes.
+    choose_side=1: choose the right/M2 side, forbid all left/M1 nodes.
+
+    The node still stores `fixed` in match-level encoding so that existing
+    violation filtering and state caching continue to work.
+    """
+    choose_side = int(choose_side)
+    if choose_side not in (0, 1):
+        return None, None
+
+    if choose_side == 0:
+        forbid_nodes = list(block["right_nodes"])
+    else:
+        forbid_nodes = list(block["left_nodes"])
+
+    forbid_set = set(int(x) for x in forbid_nodes)
+
+    child_fixed = dict(node["fixed"])
+
+    for mid in block["match_ids"]:
+        u, v = matches_hard[int(mid)][:2]
+        u = int(u)
+        v = int(v)
+
+        if u in forbid_set and v in forbid_set:
+            return None, None
+        if u not in forbid_set and v not in forbid_set:
+            # This should not happen for a proper bipartite conflict block.
+            return None, None
+
+        forbid_node = u if u in forbid_set else v
+        choice = _assignment_for_forbid_node(mid, forbid_node, matches_hard)
+        if choice is None:
+            return None, None
+
+        if int(mid) in child_fixed:
+            if int(child_fixed[int(mid)]) != int(choice):
+                return None, None
+        else:
+            child_fixed[int(mid)] = int(choice)
+
+    child_detection = node["detection"].copy()
+    child_transition = node["transition"].copy()
+    child_detection, child_transition = apply_forbid_many(
+        child_detection,
+        child_transition,
+        forbid_nodes,
+        node_in,
+        node_out,
+    )
+    if child_detection is None:
+        return None, None
+
+    child = {
+        "fixed": child_fixed,
+        "detection": child_detection,
+        "transition": child_transition,
+    }
+    child_key = tuple(sorted(child_fixed.items()))
+    child["depth"] = node.get("depth", 0) + 1
+    return child, child_key
+
+def compute_corrected_lower_bound_by_blocks(
+    current_cost,
+    violations,
+    correction_data,
+    best_cost,
+    conflict_blocks=None,
+    match_to_block=None,
+):
+    if not violations:
+        return current_cost
+
+    if not conflict_blocks or not match_to_block:
+        return compute_corrected_lower_bound(
+            current_cost,
+            violations,
+            correction_data,
+            best_cost,
+        )
+
+    viol_set = set(int(m) for m in violations)
+    used_blocks = set()
+    min_fix_cost = 0.0
+
+    for mid in viol_set:
+        bid = match_to_block.get(mid)
+
+        if bid is None:
+            min_fix_cost += float(correction_data.get(mid, 0.0))
+            continue
+
+        if bid in used_blocks:
+            continue
+
+        used_blocks.add(bid)
+        block = conflict_blocks[int(bid)]
+
+        vals = [
+            float(correction_data.get(m, 0.0))
+            for m in block["match_ids"]
+            if int(m) in viol_set
+        ]
+
+        if vals:
+            min_fix_cost += max(vals)
+
+    corrected_lb = current_cost + min_fix_cost
+    if corrected_lb >= best_cost:
+        return float("inf")
+
+    return corrected_lb
+
 def solve_hard_fusion(hard_ids,
                       movieInfo1_partial,
                       movieInfo2_partial,
                       matches_hard,
                       edges,
-                      max_bb_nodes=1000000):
+                      max_bb_nodes=1000000,
+                      batch_branch_size=2,
+                      use_initial_greedy=True,
+                      use_conflict_blocks=True,
+                      conflict_blocks_star_only=True,
+                      debug_build_graph=False,
+                      print_block_summary=False,
+                      hard_id = -1,
+                      tol=1e-6):
     """
-    Branch-and-Bound + Min-Cost Flow for hard fusion.
+    Exact Branch-and-Bound + Min-Cost Flow for hard fusion.
 
-    Parameters
-    ----------
-    all_hard_ids : list[int]
-        Node IDs in merged index space
-    movieInfo1_partial, movieInfo2_partial : dict
-        Partial movieInfo structures
-    matches_hard : array-like, shape (K, 2 or 3)
-        Matched node pairs (merged IDs)
-    edges : list[list[int]]
-        Adjacency list in merged graph
-    max_bb_nodes : int
-        Maximum number of B&B nodes to explore
-
-    Returns
-    -------
-    best_trajectories_original : list[list[int]]
-        Final trajectories in original ID space
+    Main change:
+        - Prefer same-frame conflict-block branching over individual-match
+          branching.  A star conflict block such as {843, 893} vs {764} is
+          branched as two children:
+              choose {843, 893}, forbid {764}
+              choose {764}, forbid {843, 893}
+        - Fallback to the old exact match-level batch branching when no safe
+          block covers the current violations.
+        - The block mode is exact-safe by default because it only compresses
+          k-vs-1 / 1-vs-k blocks.  General k-vs-m blocks are left to fallback
+          match-level branching unless conflict_blocks_star_only=False.
     """
+    flow_calls = 0
+    time_solve_flow = 0.0
 
-    # Step 0: build base flow graph
-    base_detection_arcs,base_transition_arcs,expand_to_original, \
+    base_detection_arcs, base_transition_arcs, expand_to_original, \
         node_in, node_out, node_single, matches_hard, threshold = build_base_graph(
-        hard_ids, movieInfo1_partial, movieInfo2_partial, matches_hard, edges)
+            hard_ids,
+            movieInfo1_partial,
+            movieInfo2_partial,
+            matches_hard,
+            edges,
+            debug=debug_build_graph,
+        )
 
-    # Branch-and-bound structures, Priority queue: (lower_bound, counter, node)
+    n1 = len(movieInfo1_partial["frames"])
+
+    if use_conflict_blocks:
+        conflict_blocks, match_to_block = build_frame_conflict_blocks(
+            matches_hard,
+            movieInfo1_partial,
+            movieInfo2_partial,
+            star_only=conflict_blocks_star_only,
+        )
+    else:
+        conflict_blocks, match_to_block = [], {}
+
+    if print_block_summary and len(matches_hard) > 0:
+        summarize_conflict_blocks(conflict_blocks, n1)
+
     best_cost = float("inf")
     best_solution = None
     flow_cache = {}
@@ -517,104 +1172,353 @@ def solve_hard_fusion(hard_ids,
     pq = []
     counter = 0
 
-    root = {"fixed": {},  # match_id -> 0 or 1
+    root = {
+        "fixed": {},
         "detection": base_detection_arcs,
-        "transition": base_transition_arcs}
+        "transition": base_transition_arcs,
+        "depth": 0,
+    }
 
-    root_sol, root_cost, root_violations = solve_flow_node(root, matches_hard, node_in, node_out)
+    t0 = time.perf_counter()
+    root_sol, root_cost, root_violations = solve_flow_node(
+        root,
+        matches_hard,
+        node_in,
+        node_out,
+    )
+    time_solve_flow += time.perf_counter() - t0
+    flow_calls += 1
 
-    # Step 1: Generate initial feasible solution by fixing violations in root solution
-    if root_sol is not None and len(root_violations) > 0:
-        initial_feasible_sol, initial_cost = repair_to_feasible(root_sol, root_violations, matches_hard, 
-                                                  node_in, node_out, base_detection_arcs, 
-                                                  base_transition_arcs)
-        if initial_feasible_sol is not None and initial_cost < best_cost:
-            best_cost = initial_cost
-            best_solution = initial_feasible_sol
+    if root_violations is None:
+        root_violations = []
+
     
-    # Initialize lower bound correction data structure
-    min_switch_cost, correction_data, cost_diff, u_switch_cost, v_switch_cost = initialize_correction_data(base_transition_arcs, matches_hard, 
-                                                node_in, node_out, threshold)
-    
-    # Compute initial lower bound with correction
-    corrected_root_lb = compute_corrected_lower_bound(root_cost, root_violations, 
-                                                     correction_data, best_cost)
-    
-    heapq.heappush(pq, (corrected_root_lb, counter, root, root_violations))
-    counter += 1
+    if root_violations is None:
+        root_violations = []
+
+    root_violations = set(int(m) for m in root_violations)
+
+    num_matches = len(matches_hard)
+
+    root_violated_matches = len(root_violations)
+    root_satisfied_matches = num_matches - root_violated_matches
+
+    # Step 1: initial feasible incumbent.
+    if root_sol is not None and root_violations is not None and len(root_violations) == 0:
+        best_cost = root_cost
+        best_solution = root_sol
+        print(f"[INIT-ROOT] root is feasible: cost={best_cost:.6f}")
+
+    elif (
+        use_initial_greedy
+        and root_sol is not None
+        and root_violations is not None
+        and len(root_violations) > 0
+    ):
+        greedy_sol, greedy_cost = find_feasible_solution_greedy(
+            root_sol=root_sol,
+            root_violations=root_violations,
+            matches_hard=matches_hard,
+            node_in=node_in,
+            node_out=node_out,
+            base_detection_arcs=base_detection_arcs,
+            base_transition_arcs=base_transition_arcs,
+            max_iter=100,
+            verbose=True,
+        )
+
+        if greedy_sol is not None and greedy_cost < best_cost:
+            print(
+                f"[INIT-BEST] improved initial feasible: "
+                f"new_best={greedy_cost:.6f}"
+            )
+            best_cost = greedy_cost
+            best_solution = greedy_sol
+
+    min_switch_cost, correction_data, cost_diff, u_switch_cost, v_switch_cost = \
+        initialize_correction_data_fast(
+            base_transition_arcs,
+            matches_hard,
+            node_in,
+            node_out,
+            threshold,
+        )
+
+    if root_sol is not None and root_violations is not None:
+        corrected_root_lb = compute_corrected_lower_bound_by_blocks(
+            root_cost,
+            root_violations,
+            correction_data,
+            best_cost,
+            conflict_blocks=conflict_blocks,
+            match_to_block=match_to_block,
+        )
+    else:
+        corrected_root_lb = float("inf")
+
+    # root_key = tuple(sorted(root["fixed"].items()))
+    # seen_states = {root_key}
+    root_violations_list = [] if root_violations is None else [int(m) for m in root_violations]
+
+    root_key = tuple(sorted(root["fixed"].items()))
+    flow_cache[root_key] = (root_sol, root_cost, root_violations_list)
+    seen_states = {root_key}
+
+    root_violations = set(root_violations_list)
+
+    if corrected_root_lb != float("inf") and corrected_root_lb < best_cost - tol:
+        heapq.heappush(pq, (corrected_root_lb, counter, root, root_violations))
+        counter += 1
 
     explored = 0
+    certified_optimal = False
+    termination_reason = "unknown"
+    final_min_lb = None
+    block_branches = 0
+    fallback_match_branches = 0
+    max_depth = 0
+    print(
+        f"[BB-START] hard_nodes={len(hard_ids)}, matches={len(matches_hard)}, "
+        f"blocks={len(conflict_blocks)}, batch_branch_size={batch_branch_size}, "
+        f"root_lb={corrected_root_lb:.6f}, initial_best={best_cost:.6f}"
+    )
 
-    # Main B&B loop
     while pq and explored < max_bb_nodes:
-        lb, _, node,_ = heapq.heappop(pq)
-        explored += 1
+        lb, _, node, _ = heapq.heappop(pq)
 
-        # Bounding
-        if lb >= best_cost:
-            continue
+        if lb >= best_cost - tol:
+            certified_optimal = True
+            termination_reason = "min_heap_lb_reached_best"
+            final_min_lb = lb
+            break
+
         key = tuple(sorted(node["fixed"].items()))
+        explored += 1
+        max_depth = max(max_depth, node.get("depth", 0))
         if key in flow_cache:
             sol, cost, violations = flow_cache[key]
         else:
-            sol, cost, violations = solve_flow_node(node, matches_hard, node_in, node_out)
+            t0 = time.perf_counter()
+            sol, cost, violations = solve_flow_node(
+                node,
+                matches_hard,
+                node_in,
+                node_out,
+            )
+            time_solve_flow += time.perf_counter() - t0
+            flow_calls += 1
             flow_cache[key] = (sol, cost, violations)
 
-        if sol is None:
+        if sol is None or violations is None:
             continue
 
-        # If no violation, we have a feasible solution
+        violations = [int(m) for m in violations if int(m) not in node["fixed"]]
+
         if len(violations) == 0:
-            if lb < best_cost:
-                best_cost = lb
+            if cost < best_cost - tol:
+                print(
+                    f"[BB-BEST] old_best={best_cost:.6f}, "
+                    f"new_best={cost:.6f}, explored={explored}, "
+                    f"fixed={len(node['fixed'])}, pq={len(pq)}"
+                )
+                best_cost = cost
                 best_solution = sol
             continue
 
-        # Branch on the first violated match
-        # match_id = violations[0]
-        match_id = max(violations, key=lambda m: min_switch_cost.get(m, 0.0))
-        u, v = matches_hard[match_id][:2]
-
-        u_cost = u_switch_cost[match_id] + cost
-        v_cost = v_switch_cost[match_id] + cost
-        best = best_cost
-        
-        if u_cost >= best and v_cost >= best:
+        if cost >= best_cost - tol:
             continue
-        elif u_cost >= best:
-            choices = [0]
-        elif v_cost >= best:
-            choices = [1]
-        else:
-            choices = [0, 1] if cost_diff[match_id] > 0 else [1, 0]
 
-        # Two branches: forbid u OR forbid v
-        for choice in choices:
-            forbid_node = v if choice == 0 else u
+        children_to_solve = []
 
-            child = {
-                "fixed": dict(node["fixed"]),
-                "detection": node["detection"].copy(),
-                "transition": node["transition"].copy()
-            }
-            child["fixed"][match_id] = choice
+        # =============================================================
+        # 1) Prefer exact-safe conflict-block branching.
+        # =============================================================
+        block = None
+        if use_conflict_blocks and len(conflict_blocks) > 0:
+            block = select_conflict_block(
+                violations=violations,
+                fixed=node["fixed"],
+                conflict_blocks=conflict_blocks,
+                match_to_block=match_to_block,
+                min_switch_cost=min_switch_cost,
+            )
 
-            child['detection'], child['transition'] = apply_forbid(child['detection'], child['transition'], forbid_node, node_in, node_out)
-            child_sol, child_cost, child_violations= solve_flow_node(child, matches_hard, node_in, node_out)
-            key = tuple(sorted(child["fixed"].items()))
-            flow_cache[key] = (child_sol, child_cost, child_violations)
-            
-            # Compute corrected lower bound for child
-            child_lb = compute_corrected_lower_bound(child_cost, child_violations, 
-                                                    correction_data, best_cost)
-            
+        if block is not None:
+            block_branches += 1
+            for choose_side in (0, 1):
+                child, child_key = build_block_child(
+                    node,
+                    block,
+                    choose_side,
+                    matches_hard,
+                    node_in,
+                    node_out,
+                )
+                if child is None:
+                    continue
+                if child_key in seen_states:
+                    continue
+                seen_states.add(child_key)
+                children_to_solve.append((child, child_key))
+
+        # =============================================================
+        # 2) Fallback: old match-level exact batch branching.
+        # =============================================================
+        if len(children_to_solve) == 0:
+            fallback_match_branches += 1
+            selected_matches = select_batch_violations(
+                violations,
+                min_switch_cost,
+                batch_size=batch_branch_size,
+            )
+
+            if len(selected_matches) == 0:
+                continue
+
+            for assignment in generate_exact_batch_assignments(selected_matches):
+                tmp_fixed = dict(node["fixed"])
+                conflict = False
+                for mid, choice in assignment.items():
+                    if mid in tmp_fixed and tmp_fixed[mid] != choice:
+                        conflict = True
+                        break
+                    tmp_fixed[mid] = choice
+                if conflict:
+                    continue
+
+                child_key = tuple(sorted(tmp_fixed.items()))
+                if child_key in seen_states:
+                    continue
+
+                child, child_key = build_batch_child(
+                    node,
+                    assignment,
+                    matches_hard,
+                    node_in,
+                    node_out,
+                )
+                if child is None:
+                    continue
+                if child_key in seen_states:
+                    continue
+                seen_states.add(child_key)
+                children_to_solve.append((child, child_key))
+
+        for child, child_key in children_to_solve:
+            t0 = time.perf_counter()
+            child_sol, child_cost, child_violations = solve_flow_node(
+                child,
+                matches_hard,
+                node_in,
+                node_out,
+            )
+            time_solve_flow += time.perf_counter() - t0
+            flow_calls += 1
+
+            flow_cache[child_key] = (child_sol, child_cost, child_violations)
+
+            if child_sol is None or child_violations is None:
+                continue
+
+            child_violations = [
+                int(m) for m in child_violations
+                if int(m) not in child["fixed"]
+            ]
+
+            if len(child_violations) == 0:
+                if child_cost < best_cost - tol:
+                    print(
+                        f"[BB-BEST] old_best={best_cost:.6f}, "
+                        f"new_best={child_cost:.6f}, explored={explored}, "
+                        f"fixed={len(child['fixed'])}, pq={len(pq)}"
+                    )
+                    best_cost = child_cost
+                    best_solution = child_sol
+                continue
+
+            child_lb = compute_corrected_lower_bound_by_blocks(
+                child_cost,
+                child_violations,
+                correction_data,
+                best_cost,
+                conflict_blocks=conflict_blocks,
+                match_to_block=match_to_block,
+            )
+
+            if child_lb == float("inf") or child_lb >= best_cost - tol:
+                continue
+
             heapq.heappush(pq, (child_lb, counter, child, child_violations))
             counter += 1
 
-    # Recover original trajectories
+    if certified_optimal:
+        pass
+    elif len(pq) == 0:
+        certified_optimal = True
+        termination_reason = "priority_queue_empty"
+        final_min_lb = best_cost
+    elif explored >= max_bb_nodes:
+        certified_optimal = False
+        termination_reason = "max_bb_nodes_reached"
+        final_min_lb = pq[0][0] if len(pq) > 0 else best_cost
+    else:
+        certified_optimal = False
+        termination_reason = "unknown_exit"
+        final_min_lb = pq[0][0] if len(pq) > 0 else best_cost
+
+    gap = max(0.0, best_cost - final_min_lb) if final_min_lb is not None else float("inf")
+
+    print(
+        f"[BB-END] hard_nodes={len(hard_ids)}, "
+        f"matches={len(matches_hard)}, "
+        f"blocks={len(conflict_blocks)}, "
+        f"explored={explored}, "
+        f"pq={len(pq)}, "
+        f"seen={len(seen_states)}, "
+        f"flow_calls={flow_calls}, "
+        f"block_branches={block_branches}, "
+        f"fallback_branches={fallback_match_branches}, "
+        f"best={best_cost:.6f}, "
+        f"final_min_lb={final_min_lb:.6f}, "
+        f"gap={gap:.6f}, "
+        f"certified_optimal={certified_optimal}, "
+        f"reason={termination_reason}, "
+        f"time_flow={time_solve_flow:.3f}s"
+    )
+
+    if not certified_optimal:
+        warnings.warn(
+            f"B&B did not certify optimality. "
+            f"best={best_cost:.6f}, "
+            f"final_min_lb={final_min_lb:.6f}, "
+            f"gap={gap:.6f}, "
+            f"reason={termination_reason}"
+        )
+
+    stats = {
+        "hard_id": int(hard_id),
+        "num_nodes": int(len(hard_ids)),
+        "num_matches": int(num_matches),
+
+        "root_satisfied_matches": int(root_satisfied_matches),
+        "root_violated_matches": int(root_violated_matches),
+
+        "max_depth": int(max_depth),   # ← 现在是 block depth
+        "branches_explored": int(explored),
+        "flow_calls": int(flow_calls),
+
+        "block_branches": int(block_branches),
+        "fallback_branches": int(fallback_match_branches),
+
+        "certified_optimal": bool(certified_optimal),
+        "termination_reason": termination_reason,
+        "time_solve_flow": float(time_solve_flow),
+    }
+
     if best_solution is None or best_cost == float("inf"):
-        warnings.warn('No feasible solution found.')
-        return []
+        warnings.warn("No feasible solution found.")
+        return [], stats
+
 
     trajectories_original = []
     for path in best_solution:
@@ -625,92 +1529,14 @@ def solve_hard_fusion(hard_ids,
         cells_unique = list(dict.fromkeys(cells))
         trajectories_original.append(np.array(cells_unique, dtype=int))
 
-    return trajectories_original
+    return trajectories_original, stats
 
-def repair_to_feasible(sol, violations, matches_hard, node_in, node_out, 
-                       detection_arcs, transition_arcs):
-    """
-    Repair a solution with violations to a feasible solution.
-    
-    Strategy: Keep all nodes that already satisfy exclusivity constraint,
-    and force fix the violated matches by selecting one node from each pair.
-    """
-    # Identify nodes that already satisfy exclusivity
-    satisfied_matches = set()
-    violated_matches = set(violations)
-    forced_choices = {}
-
-    # For all matches that are not violated, both nodes are already exclusive
-    # First, record the current choices for all matches that are not violated
-    for i in range(len(matches_hard)):
-        if i not in violations:
-            u, v = matches_hard[i][:2]
-            # Check which node is currently selected in the solution
-            u_selected = False
-            v_selected = False
-            
-            # Check if u is selected (in or out node appears in trajectories)
-            for path in sol:
-                if node_in[u] in path or node_out[u] in path:
-                    u_selected = True
-                if node_in[v] in path or node_out[v] in path:
-                    v_selected = True
-            
-            # Record the current choice
-            if u_selected and not v_selected:
-                forced_choices[i] = 0  # Choose u (forbid v)
-            elif not u_selected and v_selected:
-                forced_choices[i] = 1  # Choose v (forbid u)
-            else:
-                # This should not happen for non-violated matches
-                continue
-                
-            satisfied_matches.add(i)
-    
-    # Reconstruct the flow graph with forced choices
-    repaired_detection = detection_arcs.copy()
-    repaired_transition = transition_arcs.copy()
-    
-    # First apply fixes for already satisfied matches
-    for match_id in satisfied_matches:
-        u, v = matches_hard[match_id][:2]
-        if forced_choices[match_id] == 0:
-            # Choose u, forbid v
-            repaired_detection, repaired_transition = apply_forbid(repaired_detection, repaired_transition, v,
-                        node_in, node_out)
-        else:
-            # Choose v, forbid u
-            repaired_detection, repaired_transition = apply_forbid(repaired_detection, repaired_transition, u,
-                        node_in, node_out)
-            
-    for match_id in violations:
-        u, v = matches_hard[match_id][:2]
-        # forbid u
-        repaired_detection, repaired_transition = apply_forbid(repaired_detection, repaired_transition, v,
-                        node_in, node_out)
-        forced_choices[match_id] = 0  # 0 means choose u (forbid v)
-    
-    # Create repaired node
-    repaired_node = {
-        "fixed": forced_choices,
-        "detection": repaired_detection,
-        "transition": repaired_transition
-    }
-    
-    # Solve the repaired flow problem
-    repaired_sol, repaired_cost, repaired_violations = solve_flow_node(
-        repaired_node, matches_hard, node_in, node_out)
-    
-    if repaired_sol is not None and len(repaired_violations) == 0:
-        return repaired_sol, repaired_cost
-    else:
-        return None, None
-    
 def build_base_graph(all_hard_ids,
                      movieInfo1_partial,
                      movieInfo2_partial,
                      matches_hard,
-                     edges):
+                     edges,
+                     debug=False):
     """
     Build the base detection_arcs and transition_arcs graph.
     """
@@ -808,6 +1634,17 @@ def build_base_graph(all_hard_ids,
     # Update all_hard_ids to use the filtered list
     all_hard_ids = all_hard_ids_filtered
     edges = edges_dict
+
+    if debug and 'debug_print_base_graph_after_merge' in globals():
+        debug_print_base_graph_after_merge(
+            all_hard_ids=all_hard_ids,
+            edges=edges,
+            matches_hard=matches_hard,
+            movieInfo1_partial=movieInfo1_partial,
+            movieInfo2_partial=movieInfo2_partial,
+            merged_cells=merged_cells,
+            matches_to_remove=matches_to_remove,
+        )
 
     matched_nodes = set(matches_hard[:, 0]) | set(matches_hard[:, 1])
     unmatched_nodes = [u for u in all_hard_ids if u not in matched_nodes]
@@ -918,17 +1755,13 @@ def build_base_graph(all_hard_ids,
     return detection_arcs, transition_arcs, expand_to_original, node_in, node_out, node_single, matches_hard, threshold
 
 def solve_flow_node(node, matches_hard, node_in_id=None, node_out_id=None):
-    """
-    Solve min-cost flow and detect violations.
-    """
     try:
         trajectories, cost = mcc4mot(node["detection"], node["transition"])
-    except Exception as e:
-        warnings.warn(f"mcc4mot failed in solve_flow_node: {e}")
-        return None, float("inf"), []
+    except Exception:
+        return None, float("inf"), None
 
     if trajectories is None:
-        return None, float("inf"), []
+        return None, float("inf"), None
 
     violations = find_violations(
         trajectories,
@@ -937,59 +1770,74 @@ def solve_flow_node(node, matches_hard, node_in_id=None, node_out_id=None):
         node_out_id,
     )
 
-    return trajectories, np.sum(cost), violations
+    return trajectories, float(np.sum(cost)), violations
 
-def initialize_correction_data(transition_arcs, matches_hard, node_in, node_out, threshold):
+def initialize_correction_data_fast(transition_arcs, matches_hard, node_in, node_out, threshold):
     """
-    Initialize data structure for lower bound correction.
-    
-    For each match, compute the minimum additional cost required to switch
-    from having both nodes selected to having only one selected.
+    Faster version of initialize_correction_data.
+
+    Original complexity:
+        O(num_matches * num_transition_arcs)
+
+    New complexity:
+        O(num_transition_arcs + num_matches)
     """
     min_switch_cost = {}
     cost_diff = {}
     u_switched_cost = {}
     v_switched_cost = {}
 
+    # node_id -> min incoming / outgoing transition cost
+    incoming_min = defaultdict(lambda: threshold)
+    outgoing_min = defaultdict(lambda: threshold)
+
+    # One pass over all transition arcs
+    for s, t, cost in transition_arcs:
+        s = int(s)
+        t = int(t)
+        cost = float(cost)
+
+        if cost < outgoing_min[s]:
+            outgoing_min[s] = cost
+        if cost < incoming_min[t]:
+            incoming_min[t] = cost
+
     for match_id, (u, v, *_) in enumerate(matches_hard):
-        # Find all incoming/outgoing edges for u and v
-        u_incoming_cost = []
-        u_outgoing_cost = []
-        v_incoming_cost = []
-        v_outgoing_cost = []
-        
-        # Collect transition costs
-        for s, t, cost in transition_arcs:
-            if t == node_in.get(u, -1):
-                u_incoming_cost.append(cost)
-            if s == node_out.get(u, -1):
-                u_outgoing_cost.append(cost)
-            if t == node_in.get(v, -1):
-                v_incoming_cost.append(cost)
-            if s == node_out.get(v, -1):
-                v_outgoing_cost.append(cost)
-        
-        # Compute minimum costs
-        u_in_min = min(u_incoming_cost) if u_incoming_cost else threshold
-        u_out_min = min(u_outgoing_cost) if u_outgoing_cost else threshold
-        v_in_min = min(v_incoming_cost) if v_incoming_cost else threshold
-        v_out_min = min(v_outgoing_cost) if v_outgoing_cost else threshold
-        
-        min_violation_cost = max(u_in_min + v_out_min, v_in_min + u_out_min)
+        u = int(u)
+        v = int(v)
+
+        u_in = node_in.get(u, -1)
+        u_out = node_out.get(u, -1)
+        v_in = node_in.get(v, -1)
+        v_out = node_out.get(v, -1)
+
+        u_in_min = incoming_min[u_in]
+        u_out_min = outgoing_min[u_out]
+        v_in_min = incoming_min[v_in]
+        v_out_min = outgoing_min[v_out]
+
+        min_violation_cost = max(
+            u_in_min + v_out_min,
+            v_in_min + u_out_min
+        )
+
         u_min_cost = u_in_min + u_out_min
         v_min_cost = v_in_min + v_out_min
         min_feasible_cost = min(u_min_cost, v_min_cost)
-        # Minimum cost to switch from selecting both to selecting only one
-        # This is problem-specific heuristic
-        min_switch_cost[match_id] = min_feasible_cost - min_violation_cost
+
+        raw_switch = min_feasible_cost - min_violation_cost
+
+        min_switch_cost[match_id] = raw_switch
         cost_diff[match_id] = u_min_cost - v_min_cost
-        u_switched_cost[match_id] = u_min_cost - min_violation_cost
-        v_switched_cost[match_id] = v_min_cost - min_violation_cost
-        
-    min_switch_cost_modified = {key: max(value, 0) for key, value in min_switch_cost.items()}
-    u_switched_cost = {key: max(value, 0) for key, value in u_switched_cost.items()}
-    v_switched_cost = {key: max(value, 0) for key, value in v_switched_cost.items()}
-    return min_switch_cost, min_switch_cost_modified, cost_diff, u_switched_cost, v_switched_cost
+        u_switched_cost[match_id] = max(u_min_cost - min_violation_cost, 0.0)
+        v_switched_cost[match_id] = max(v_min_cost - min_violation_cost, 0.0)
+
+    correction_data = {
+        key: max(value, 0.0)
+        for key, value in min_switch_cost.items()
+    }
+
+    return min_switch_cost, correction_data, cost_diff, u_switched_cost, v_switched_cost
 
 def compute_corrected_lower_bound(current_cost, violations, correction_data, best_cost):
     """
@@ -1014,50 +1862,56 @@ def compute_corrected_lower_bound(current_cost, violations, correction_data, bes
     
     return corrected_lb
 
-def compute_solution_cost(sol, detection_arcs, transition_arcs, matches_hard, node_in, node_out):
+def apply_forbid_many(detection_arcs, transition_arcs, forbid_ids, node_in, node_out):
     """
-    Compute total cost of a solution.
+    Forbid multiple original cells at once.
+
+    This is equivalent to repeated apply_forbid calls, but it filters the
+    transition array only once.  It is especially useful for conflict-block
+    branching, where choosing one side may forbid several original cells.
     """
-    total_cost = 0
-    
-    # Map solution to node selections
-    selected_nodes = set()
-    for path in sol:
-        for node in path:
-            selected_nodes.add(node)
-    
-    # Add detection costs
-    for arc in detection_arcs:
-        node_id = arc[0]
-        # Check if node is selected (assuming detection cost is in arc[3])
-        if node_id in selected_nodes:
-            total_cost += arc[3]
-    
-    # Add transition costs
-    for path in sol:
-        for i in range(len(path)-1):
-            from_node = path[i]
-            to_node = path[i+1]
-            # Find transition cost
-            for s, t, cost in transition_arcs:
-                if s == from_node and t == to_node:
-                    total_cost += cost
-                    break
-    
-    return total_cost
+    BIG = 1e3
 
-def apply_forbid(detection_arcs, transition_arcs, forbid_id, node_in, node_out): 
-    """ Forbid a node by disabling detection and removing all incident transitions. """ 
-    BIG = 1e3 
-    # Disable detection 
-    detection_arcs[np.where(detection_arcs[:, 0] == node_in[forbid_id])[0], 1:3] = BIG 
-    detection_arcs[np.where(detection_arcs[:, 0] == node_out[forbid_id])[0], 1:3] = BIG 
+    forbid_ids = [int(x) for x in forbid_ids]
+    if len(forbid_ids) == 0:
+        return detection_arcs, transition_arcs
 
-    # Remove transition
-    keep = [] 
-    for s, t, _ in transition_arcs: 
-        keep.append((s != node_in[forbid_id]) and (t != node_in[forbid_id]) and (s != node_out[forbid_id]) and (t != node_out[forbid_id])) 
-    return detection_arcs, transition_arcs[np.array(keep)]
+    in_out_ids = []
+    for fid in dict.fromkeys(forbid_ids):
+        if fid not in node_in or fid not in node_out:
+            return None, None
+        in_out_ids.append(int(node_in[fid]))
+        in_out_ids.append(int(node_out[fid]))
+
+    in_out_ids = np.asarray(sorted(set(in_out_ids)), dtype=np.int64)
+
+    ids = detection_arcs[:, 0].astype(np.int64)
+    det_mask = np.isin(ids, in_out_ids)
+    detection_arcs[det_mask, 1:3] = BIG
+
+    if transition_arcs is None or len(transition_arcs) == 0:
+        return detection_arcs, transition_arcs
+
+    src = transition_arcs[:, 0].astype(np.int64)
+    dst = transition_arcs[:, 1].astype(np.int64)
+    bad_src = np.isin(src, in_out_ids)
+    bad_dst = np.isin(dst, in_out_ids)
+    keep = ~(bad_src | bad_dst)
+
+    return detection_arcs, transition_arcs[keep]
+
+def apply_forbid(detection_arcs, transition_arcs, forbid_id, node_in, node_out):
+    """
+    Forbid one original cell by disabling its in/out detection nodes and
+    removing all incident transition arcs.
+    """
+    return apply_forbid_many(
+        detection_arcs,
+        transition_arcs,
+        [int(forbid_id)],
+        node_in,
+        node_out,
+    )
 
 def find_violations(trajectories, matches_hard, node_in_id, node_out_id):
     """
@@ -1109,56 +1963,26 @@ def find_violations(trajectories, matches_hard, node_in_id, node_out_id):
     return violations
 
 def mcc4mot(detection_arcs, transition_arcs):
-    """
-    Python wrapper of pyCS2 min-cost circulation solver.
-
-    Input
-    -----
-    detection_arcs : ndarray, shape (n, 4)
-        [detection_id, C_i, C_i_en, C_i_ex]
-    transition_arcs : ndarray, shape (m, 3)
-        [src_id, dst_id, C_ij]
-
-    Return
-    ------
-    traj : list[np.ndarray]
-    cost : list[float]
-    """
-    detection_arcs_tem = np.ascontiguousarray(detection_arcs, dtype=np.float64).copy()
-    transition_arcs_tem = np.ascontiguousarray(transition_arcs, dtype=np.float64).copy()
-
-    if detection_arcs_tem.ndim != 2 or detection_arcs_tem.shape[1] != 4:
-        raise ValueError(f"detection_arcs must have shape (n, 4), got {detection_arcs_tem.shape}")
-
-    if transition_arcs_tem.ndim != 2 or transition_arcs_tem.shape[1] != 3:
-        raise ValueError(f"transition_arcs must have shape (m, 3), got {transition_arcs_tem.shape}")
-
-    # Convert 0-based Python ids to 1-based ids expected by cinda_data_process.
-    detection_arcs_tem[:, 0] += 1
-    transition_arcs_tem[:, :2] += 1
-
-    _cinda = get_cinda_lib()
+    _cinda = get_cinda_solver()
 
     mtail, mhead, mlow, macap, mcost, msz = cinda_data_process(
-        detection_arcs_tem,
-        transition_arcs_tem,
+        detection_arcs,
+        transition_arcs,
     )
 
-    it_flag = False
-    if len(mcost) > 0 and isinstance(mcost[0], float):
-        mcost = [int(n * 10**7) for n in mcost]
-        it_flag = True
+    scale = 10 ** 7
+    mcost = np.rint(mcost * scale).astype(np.float64, copy=False)
 
-    inf_type = ctypes.c_long * msz[0]
-    a_type = ctypes.c_double * msz[2]
+    inf_type = ctypes.c_long * len(msz)
+    double_ptr = ctypes.POINTER(ctypes.c_double)
 
     track_vec = _cinda.pyCS2(
         inf_type(*msz),
-        a_type(*mtail),
-        a_type(*mhead),
-        a_type(*mlow),
-        a_type(*macap),
-        a_type(*mcost),
+        mtail.ctypes.data_as(double_ptr),
+        mhead.ctypes.data_as(double_ptr),
+        mlow.ctypes.data_as(double_ptr),
+        macap.ctypes.data_as(double_ptr),
+        mcost.ctypes.data_as(double_ptr),
     )
 
     cost = []
@@ -1169,199 +1993,340 @@ def mcc4mot(detection_arcs, transition_arcs):
         if track_vec[i] > 0:
             sub_traj.append(track_vec[i])
         else:
-            cost.append(track_vec[i])
+            cost.append(float(track_vec[i]) / scale)
             new = [int(x / 2) for x in sub_traj[::2]]
-            traj.append(np.array(new) - 1)
+            traj.append(np.array(new, dtype=int) - 1)
             sub_traj = []
-
-    if it_flag:
-        cost = [(float(n) / 10**7) for n in cost]
 
     return traj, cost
 
 def cinda_data_process(detection_arcs, transition_arcs):
-    mtail = []
-    mhead = []
-    mlow = []
-    macap = []
-    mcost = []
+    detection_arcs = np.asarray(detection_arcs, dtype=np.float64)
+    transition_arcs = np.asarray(transition_arcs, dtype=np.float64)
 
-    n_detection = len(detection_arcs)
-    n_transition = len(transition_arcs)
-    n_traj = n_detection * 3 + n_transition
+    n_detection = detection_arcs.shape[0]
+    n_transition = transition_arcs.shape[0]
+    n_arcs = n_detection * 3 + n_transition
 
-    mlow = [0] * n_traj
-    macap = [1] * n_traj
+    mtail = np.empty(n_arcs, dtype=np.float64)
+    mhead = np.empty(n_arcs, dtype=np.float64)
+    mlow = np.zeros(n_arcs, dtype=np.float64)
+    macap = np.ones(n_arcs, dtype=np.float64)
+    mcost = np.empty(n_arcs, dtype=np.float64)
 
-    # construct entry arc in detection_arcs
-    mtail.extend([1] * n_detection)
-    mhead.extend(detection_arcs[:, 0] * 2)
-    mcost.extend(detection_arcs[:, 1])
+    # 这里直接转成 C solver 需要的 1-based detection id
+    det_id = detection_arcs[:, 0] + 1
 
-    # construct existing arc in detection_arcs
-    mtail.extend(detection_arcs[:, 0] * 2 + 1)
-    mhead.extend([1] * n_detection)
-    mcost.extend(detection_arcs[:, 2])
+    a = 0
+    b = n_detection
+    mtail[a:b] = 1
+    mhead[a:b] = det_id * 2
+    mcost[a:b] = detection_arcs[:, 1]
 
-    # construct detection arc in detection_arcs
-    mtail.extend(detection_arcs[:, 0] * 2)
-    mhead.extend(detection_arcs[:, 0] * 2 + 1)
-    mcost.extend(detection_arcs[:, 3])
+    a = b
+    b = a + n_detection
+    mtail[a:b] = det_id * 2 + 1
+    mhead[a:b] = 1
+    mcost[a:b] = detection_arcs[:, 2]
 
-    # construct transition arc
-    mtail.extend(transition_arcs[:, 0] * 2 + 1)
-    mhead.extend(transition_arcs[:, 1] * 2)
-    mcost.extend(transition_arcs[:, 2])
-    
-    msz = [12, 2 * n_detection + 1, len(mtail)]
+    a = b
+    b = a + n_detection
+    mtail[a:b] = det_id * 2
+    mhead[a:b] = det_id * 2 + 1
+    mcost[a:b] = detection_arcs[:, 3]
+
+    a = b
+    b = a + n_transition
+    if n_transition > 0:
+        src_id = transition_arcs[:, 0] + 1
+        dst_id = transition_arcs[:, 1] + 1
+        mtail[a:b] = src_id * 2 + 1
+        mhead[a:b] = dst_id * 2
+        mcost[a:b] = transition_arcs[:, 2]
+
+    msz = [12, int(2 * n_detection + 1), int(n_arcs)]
     return mtail, mhead, mlow, macap, mcost, msz
 
-def ovDistanceRegion(curRegVox: np.ndarray, nextRegVox: np.ndarray, 
-                    frame_shift: Optional[np.ndarray] = None, 
-                    ovFlag: bool = False) -> Tuple[float, float, np.ndarray, float]:
+def ovDistanceRegion(curRegVox: np.ndarray,
+                     nextRegVox: np.ndarray,
+                     frame_shift: Optional[np.ndarray] = None,
+                     ovFlag: bool = False) -> Tuple[float, float, np.ndarray, float]:
     """
-    Calculate the overlapping distance between two regions
+    Calculate region-to-region distance.
+
+    Default behavior:
+      - 3D vox: use EDT distance, same as before.
+      - 2D vox: lift [y, x] to [z=0, y, x], then use the same EDT distance.
     
-    Parameters:
-    -----------
-    curRegVox : np.ndarray
-        coordinates of the current region z,y,x
-    nextRegVox : np.ndarray
-        coordinates of the neighboring region with order the same as curRegVox
-    frame_shift : np.ndarray, optional
-        shift vector (same order as curRegVox)
-    ovFlag : bool, optional
-        whether using overlapping ratio as distance
-        
-    Returns:
-    --------
-    maxDistance : float
-        maximum distance
-    minDistance : float
-        minimum distance
-    distances : np.ndarray
-        overlapping distances between two regions
-    re_ratio : float
-        redundancy ratio
+    If ovFlag=True, explicitly use old overlap/Jaccard cost.
     """
-    
+
+    curRegVox = np.asarray(curRegVox)
+    nextRegVox = np.asarray(nextRegVox)
+
+    if curRegVox.ndim != 2 or nextRegVox.ndim != 2:
+        raise ValueError(
+            f"vox must be 2D arrays, got {curRegVox.shape}, {nextRegVox.shape}"
+        )
+
+    if curRegVox.shape[1] != nextRegVox.shape[1]:
+        raise ValueError(
+            f"vox dimension mismatch: {curRegVox.shape} vs {nextRegVox.shape}"
+        )
+
+    dim = curRegVox.shape[1]
     re_ratio = 0.0
+
     if frame_shift is None:
-        if curRegVox.shape[1] == 3:
-            frame_shift = np.array([0, 0, 0])
-        elif curRegVox.shape[1] == 2:
-            frame_shift = np.array([0, 0])
-        else:
-            frame_shift = np.array([])
-    if curRegVox.shape[1] == 2:
-        ovFlag = True
-    if not ovFlag:
-        # After downsampling, we can use this method to calculate distance
-        if nextRegVox.shape[0] < 2 or curRegVox.shape[0] < 2:
-            # Less than 2 pixels
-            distances = np.array([100.0, 100.0])
-        else:
-            # Calculate bounding boxes
-            st_pt1 = np.min(curRegVox, axis=0)
-            end_pt1 = np.max(curRegVox, axis=0)
-            bw_sz1 = np.ceil(end_pt1 - st_pt1 + 1).astype(int)
-            
-            # Create binary mask for first region
-            mask1 = np.zeros(bw_sz1, dtype=bool)
-            cell1_sub = (curRegVox - st_pt1).astype(int)
-            mask1[tuple(cell1_sub.T)] = True
-            cell1_idx = np.ravel_multi_index(
-                tuple(cell1_sub.T),dims=bw_sz1)
-
-            st_pt2 = np.min(nextRegVox, axis=0)
-            end_pt2 = np.max(nextRegVox, axis=0)
-            bw_sz2 = np.ceil(end_pt2 - st_pt2 + 1).astype(int)
-            
-            # Create binary mask for second region
-            mask2 = np.zeros(bw_sz2, dtype=bool)
-            cell2_sub = (nextRegVox - st_pt2).astype(int)
-            cell2_idx = np.ravel_multi_index(tuple(cell2_sub.T), bw_sz2)
-            mask2[tuple(cell2_sub.T)] = True
-            
-            # Calculate distances using Euclidean distance transform
-            
-            # Calculate shift
-            mov_shift = (st_pt2 - st_pt1 - frame_shift).astype(float)
-
-            dist2cell1 = edt_3d(mask1, mask2, mov_shift)
-            dist2cell2 = edt_3d(mask2, mask1, -mov_shift)
-                
-            distances_n2c_way5 = dist2cell1[tuple(cell2_sub.T)]
-            distances_c2n_way5 = dist2cell2[tuple(cell1_sub.T)]
-            
-            distances_n2c_way5 = np.sqrt(np.array(distances_n2c_way5))
-            distances_c2n_way5 = np.sqrt(np.array(distances_c2n_way5))
-            
-            distances = np.array([
-                np.mean(distances_c2n_way5),
-                np.mean(distances_n2c_way5)
-            ])  # i2j and j2i
-            
-            # Calculate redundancy ratio
-            boxSize = np.prod(bw_sz1) + np.prod(bw_sz2)
-            redundant_sz = boxSize - len(cell2_sub)
-            re_ratio = redundant_sz / boxSize
+        frame_shift = np.zeros(dim, dtype=float)
     else:
-        # Purely based on overlapping ratio
-        # Find intersection of points
+        frame_shift = np.asarray(frame_shift, dtype=float)
+
+    # ------------------------------------------------------------
+    # Optional old overlap cost.
+    # Only used when caller explicitly passes ovFlag=True.
+    # ------------------------------------------------------------
+    if ovFlag:
         cur_set = set(tuple(pt) for pt in curRegVox)
         next_set = set(tuple(pt) for pt in nextRegVox)
         intersection = cur_set.intersection(next_set)
-        
-        overlap_ratio = len(intersection) / (len(cur_set) + len(next_set) - len(intersection))
+
+        overlap_ratio = len(intersection) / (
+            len(cur_set) + len(next_set) - len(intersection)
+        )
+
         distances = -np.log(overlap_ratio) if overlap_ratio > 0 else 1e4
-        distances = [distances,distances]
+        distances = np.array([distances, distances], dtype=float)
         re_ratio = overlap_ratio
-    maxDistance = np.max(distances)
-    minDistance = np.min(distances)
-    
+
+        maxDistance = float(np.max(distances))
+        minDistance = float(np.min(distances))
+        return maxDistance, minDistance, distances, re_ratio
+
+    # ------------------------------------------------------------
+    # Key change:
+    # 2D [y, x] -> pseudo-3D [z=0, y, x]
+    # Then it goes through exactly the same EDT branch as 3D.
+    # ------------------------------------------------------------
+    if dim == 2:
+        z_cur = np.zeros((curRegVox.shape[0], 1), dtype=curRegVox.dtype)
+        z_next = np.zeros((nextRegVox.shape[0], 1), dtype=nextRegVox.dtype)
+
+        curRegVox = np.concatenate([z_cur, curRegVox], axis=1)
+        nextRegVox = np.concatenate([z_next, nextRegVox], axis=1)
+
+        # Original 2D shift is [y, x].
+        # After lifting to [z, y, x], shift becomes [0, y, x].
+        frame_shift = np.array([0.0, frame_shift[0], frame_shift[1]], dtype=float)
+        dim = 3
+
+    if dim != 3:
+        raise ValueError(f"Unsupported vox dimension: {dim}")
+
+    # ------------------------------------------------------------
+    # Same EDT logic as your original 3D branch.
+    # ------------------------------------------------------------
+    if nextRegVox.shape[0] < 2 or curRegVox.shape[0] < 2:
+        distances = np.array([100.0, 100.0], dtype=float)
+        maxDistance = float(np.max(distances))
+        minDistance = float(np.min(distances))
+        return maxDistance, minDistance, distances, re_ratio
+
+    st_pt1 = np.min(curRegVox, axis=0)
+    end_pt1 = np.max(curRegVox, axis=0)
+    bw_sz1 = np.ceil(end_pt1 - st_pt1 + 1).astype(int)
+
+    mask1 = np.zeros(bw_sz1, dtype=bool)
+    cell1_sub = (curRegVox - st_pt1).astype(int)
+    mask1[tuple(cell1_sub.T)] = True
+
+    st_pt2 = np.min(nextRegVox, axis=0)
+    end_pt2 = np.max(nextRegVox, axis=0)
+    bw_sz2 = np.ceil(end_pt2 - st_pt2 + 1).astype(int)
+
+    mask2 = np.zeros(bw_sz2, dtype=bool)
+    cell2_sub = (nextRegVox - st_pt2).astype(int)
+    mask2[tuple(cell2_sub.T)] = True
+
+    mov_shift = (st_pt2 - st_pt1 - frame_shift).astype(float)
+
+    dist2cell1 = edt_3d(mask1, mask2, mov_shift)
+    dist2cell2 = edt_3d(mask2, mask1, -mov_shift)
+
+    distances_n2c_way5 = dist2cell1[tuple(cell2_sub.T)]
+    distances_c2n_way5 = dist2cell2[tuple(cell1_sub.T)]
+
+    distances_n2c_way5 = np.sqrt(np.asarray(distances_n2c_way5))
+    distances_c2n_way5 = np.sqrt(np.asarray(distances_c2n_way5))
+
+    distances = np.array([
+        np.mean(distances_c2n_way5),
+        np.mean(distances_n2c_way5),
+    ], dtype=float)
+
+    boxSize = np.prod(bw_sz1) + np.prod(bw_sz2)
+    redundant_sz = boxSize - len(cell2_sub)
+    re_ratio = redundant_sz / boxSize
+
+    maxDistance = float(np.max(distances))
+    minDistance = float(np.min(distances))
+
     return maxDistance, minDistance, distances, re_ratio
 
 def edt_3d(ref_cell, mov_cell, shift):
-
-
-
     """
-    Compute 3D Euclidean Distance Transform
-    
-    Parameters:
-    -----------
-    ref_cell : numpy.ndarray (bool, 3D)
-        Reference cell mask
-    mov_cell : numpy.ndarray (bool, 3D)
-        Moving cell mask
-    shift : list or numpy.ndarray (float, 3)
-        [y, x, z] shifts
-        
-    Returns:
-    --------
-    output : numpy.ndarray (float, 3D)
-        Distance transform result
+    Compute EDT using the existing C++ edt_3d.
+
+    Supports:
+      - 3D mask: used directly.
+      - 2D mask: lifted to one-slice 3D mask.
     """
+
     ref_cell = np.asarray(ref_cell, dtype=np.bool_).astype(np.uint8)
     mov_cell = np.asarray(mov_cell, dtype=np.bool_).astype(np.uint8)
     shift = np.asarray(shift, dtype=np.float32)
-    
+
+    squeeze_2d = False
+
+    if ref_cell.ndim == 2:
+        if mov_cell.ndim != 2:
+            raise ValueError(
+                f"ref_cell is 2D but mov_cell is {mov_cell.ndim}D"
+            )
+
+        # Current Python-side convention:
+        # 2D mask [y, x] -> pseudo-3D mask [z=0, y, x]
+        ref_cell = ref_cell[None, :, :]
+        mov_cell = mov_cell[None, :, :]
+
+        # shift [y, x] -> [z, y, x]
+        if shift.size == 2:
+            shift = np.array([0.0, shift[0], shift[1]], dtype=np.float32)
+        elif shift.size != 3:
+            raise ValueError(f"2D shift must have size 2 or 3, got {shift}")
+
+        squeeze_2d = True
+
+    elif ref_cell.ndim == 3:
+        if mov_cell.ndim != 3:
+            raise ValueError(
+                f"ref_cell is 3D but mov_cell is {mov_cell.ndim}D"
+            )
+
+        if shift.size != 3:
+            raise ValueError(f"3D shift must have size 3, got {shift}")
+
+    else:
+        raise ValueError(f"Unsupported ref_cell.ndim={ref_cell.ndim}")
+
+    ref_cell = np.ascontiguousarray(ref_cell)
+    mov_cell = np.ascontiguousarray(mov_cell)
+    shift = np.ascontiguousarray(shift.astype(np.float32))
+
     ref_dims = np.array(ref_cell.shape, dtype=np.int32)
     mov_dims = np.array(mov_cell.shape, dtype=np.int32)
-    output = np.zeros(mov_cell.shape, dtype=np.float32)
 
     lib = get_edt3d_lib()
+    output = np.zeros(mov_cell.shape, dtype=np.float32)
+
     lib.edt_3d(
         ref_cell,
-        ref_dims,3,
+        ref_dims,
+        3,
         mov_cell,
-        mov_dims,3,
+        mov_dims,
+        3,
         shift,
-        output
+        output,
     )
-    # output = output.transpose(2, 0, 1)  # yxz -> zyx
+
+    if squeeze_2d:
+        return output[0]
+
     return output
+
+def infer_vox_dim(movieInfo1_partial, movieInfo2_partial):
+    for mi in (movieInfo1_partial, movieInfo2_partial):
+        for vox in mi.get("vox", []):
+            vox = np.asarray(vox)
+            if vox.ndim == 2 and vox.shape[0] > 0:
+                return int(vox.shape[1])
+    return 3
+
+def get_global_vox(global_id, n1, movieInfo1_partial, movieInfo2_partial):
+    global_id = int(global_id)
+
+    if global_id < n1:
+        return movieInfo1_partial["vox"][global_id]
+    else:
+        return movieInfo2_partial["vox"][global_id - n1]
+
+def recompute_2d_transition_costs_by_edt(
+    transition_arcs,
+    movieInfo1_partial,
+    movieInfo2_partial,
+    verbose=True,
+):
+    """
+    Recompute real-node transition costs for 2D data using EDT principle.
+    Pseudo/control-node arcs are not changed.
+    """
+
+    vox_dim = infer_vox_dim(movieInfo1_partial, movieInfo2_partial)
+
+    if vox_dim != 2:
+        return transition_arcs
+
+    n1 = len(movieInfo1_partial["frames"])
+    n2 = len(movieInfo2_partial["frames"])
+    N = n1 + n2
+
+    transition_arcs = np.ascontiguousarray(
+        transition_arcs,
+        dtype=np.float64,
+    ).copy()
+
+    changed = 0
+    real_arcs = 0
+
+    for k in range(len(transition_arcs)):
+        u = int(transition_arcs[k, 0])
+        v = int(transition_arcs[k, 1])
+
+        # Skip pseudo/control nodes.
+        if u >= N or v >= N:
+            continue
+
+        vox_u = get_global_vox(
+            u,
+            n1,
+            movieInfo1_partial,
+            movieInfo2_partial,
+        )
+        vox_v = get_global_vox(
+            v,
+            n1,
+            movieInfo1_partial,
+            movieInfo2_partial,
+        )
+
+        old_cost = float(transition_arcs[k, 2])
+        new_cost = float(ovDistanceRegion(vox_u, vox_v, ovFlag=False)[0])
+
+        transition_arcs[k, 2] = new_cost
+
+        if not np.isclose(old_cost, new_cost):
+            changed += 1
+
+        real_arcs += 1
+
+    if verbose:
+        print(
+            f"[2D-EDT-COST] recomputed transition costs: "
+            f"real_arcs={real_arcs}, changed={changed}"
+        )
+
+    return transition_arcs
 
 def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, movieInfo2_partial, idmap1=None, idmap2=None, keep_parent_idx=None, crop_area=[], tm_shift = 0, img_shape = None, seg_indice = 'python'):
     """
@@ -1381,27 +2346,81 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
     """
     
     # Initialize result structure
-    if len(crop_area) > 0:
-        if len(crop_area[0]) == 2:
-            movieInfo1_partial['xCoord'] = movieInfo1_partial['xCoord'] + crop_area[1][0]
-            movieInfo1_partial['yCoord'] = movieInfo1_partial['yCoord'] + crop_area[0][0]
-            movieInfo2_partial['xCoord'] = movieInfo2_partial['xCoord'] + crop_area[1][0]
-            movieInfo2_partial['yCoord'] = movieInfo2_partial['yCoord'] + crop_area[0][0]
-            movieInfo1_partial['vox'] = [vox - np.array([crop_area[0][0], crop_area[1][0]]) 
-                for vox in movieInfo1_partial['vox']]
-            movieInfo2_partial['vox'] = [vox + np.array([crop_area[0][0], crop_area[1][0]]) 
-                for vox in movieInfo2_partial['vox']]
-        if len(crop_area[0]) == 3:
-            movieInfo1_partial['xCoord'] = movieInfo1_partial['xCoord'] + crop_area[2][0]
-            movieInfo1_partial['yCoord'] = movieInfo1_partial['yCoord'] + crop_area[1][0]
-            movieInfo1_partial['zCoord'] = movieInfo1_partial['zCoord'] + crop_area[0][0]
-            movieInfo2_partial['xCoord'] = movieInfo2_partial['xCoord'] + crop_area[2][0]
-            movieInfo2_partial['yCoord'] = movieInfo2_partial['yCoord'] + crop_area[1][0]
-            movieInfo2_partial['zCoord'] = movieInfo2_partial['zCoord'] + crop_area[0][0]
-            movieInfo1_partial['vox'] = [vox - np.array([crop_area[0][0], crop_area[1][0], crop_area[2][0]]) 
-                for vox in movieInfo1_partial['vox']]
-            movieInfo2_partial['vox'] = [vox + np.array([crop_area[0][0], crop_area[1][0], crop_area[2][0]]) 
-                for vox in movieInfo2_partial['vox']]
+    # ============================================================
+    # Recover coordinates for cropped partial movieInfo
+    # ============================================================
+    if crop_area is not None and len(crop_area) > 0:
+
+        crop_dim = len(crop_area)
+
+        # -------------------------
+        # 2D case
+        # -------------------------
+        if crop_dim == 2:
+            y0 = crop_area[0][0]
+            x0 = crop_area[1][0]
+
+            if 'xCoord' in movieInfo1_partial:
+                movieInfo1_partial['xCoord'] = movieInfo1_partial['xCoord'] + x0
+            if 'yCoord' in movieInfo1_partial:
+                movieInfo1_partial['yCoord'] = movieInfo1_partial['yCoord'] + y0
+
+            if 'xCoord' in movieInfo2_partial:
+                movieInfo2_partial['xCoord'] = movieInfo2_partial['xCoord'] + x0
+            if 'yCoord' in movieInfo2_partial:
+                movieInfo2_partial['yCoord'] = movieInfo2_partial['yCoord'] + y0
+
+            offset_vox = np.array([y0, x0], dtype=np.asarray(movieInfo1_partial['vox'][0]).dtype)
+
+            movieInfo1_partial['vox'] = [
+                np.asarray(vox) - offset_vox
+                for vox in movieInfo1_partial['vox']
+            ]
+
+            movieInfo2_partial['vox'] = [
+                np.asarray(vox) + offset_vox
+                for vox in movieInfo2_partial['vox']
+            ]
+
+        # -------------------------
+        # 3D case
+        # -------------------------
+        elif crop_dim == 3:
+            z0 = crop_area[0][0]
+            y0 = crop_area[1][0]
+            x0 = crop_area[2][0]
+
+            if 'xCoord' in movieInfo1_partial:
+                movieInfo1_partial['xCoord'] = movieInfo1_partial['xCoord'] + x0
+            if 'yCoord' in movieInfo1_partial:
+                movieInfo1_partial['yCoord'] = movieInfo1_partial['yCoord'] + y0
+            if 'zCoord' in movieInfo1_partial:
+                movieInfo1_partial['zCoord'] = movieInfo1_partial['zCoord'] + z0
+
+            if 'xCoord' in movieInfo2_partial:
+                movieInfo2_partial['xCoord'] = movieInfo2_partial['xCoord'] + x0
+            if 'yCoord' in movieInfo2_partial:
+                movieInfo2_partial['yCoord'] = movieInfo2_partial['yCoord'] + y0
+            if 'zCoord' in movieInfo2_partial:
+                movieInfo2_partial['zCoord'] = movieInfo2_partial['zCoord'] + z0
+
+            # vox order is [z, y, x]
+            offset_vox = np.array([z0, y0, x0], dtype=np.asarray(movieInfo1_partial['vox'][0]).dtype)
+
+            movieInfo1_partial['vox'] = [
+                np.asarray(vox) - offset_vox
+                for vox in movieInfo1_partial['vox']
+            ]
+
+            movieInfo2_partial['vox'] = [
+                np.asarray(vox) + offset_vox
+                for vox in movieInfo2_partial['vox']
+            ]
+
+        else:
+            raise ValueError(
+                f"Unsupported crop_area dimension: len(crop_area)={crop_dim}, crop_area={crop_area}"
+            )
             
     movieInfo1['frames'] = movieInfo1['frames'] + tm_shift
     movieInfo2['frames'] = movieInfo2['frames'] + tm_shift
@@ -1515,7 +2534,7 @@ def create_fused_movieInfo(tracks, movieInfo1, movieInfo2, movieInfo1_partial, m
                 cell_data = {key: movieInfo2[key][full_id] for key in 
                             ['xCoord', 'yCoord', 'zCoord', 'frames', 'vox', 'voxIdx']}
                 # Copy original parent (adjust later if needed)
-                parent_id = movieInfo2['parents'][full_id] + n1_all
+                parent_id = -1 if movieInfo2['parents'][full_id] == -1 else movieInfo2['parents'][full_id] + n1_all
                 new_id = add_cell(cell_data, parent_id)
                 old_to_new_id[full_id + n1_all] = new_id
                 new_id_counter += 1
