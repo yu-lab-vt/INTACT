@@ -9,9 +9,50 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'C_package'))
 import csv
 import time
 import pickle
-# import pulp
+import pulp
+import tif2mantrack
+
+def _format_array_range(arr, ndigits=3):
+    """
+    Return range string for a numeric array/list.
+    """
+    if arr is None:
+        return "None"
+
+    arr = np.asarray(arr)
+
+    if arr.size == 0:
+        return "empty"
+
+    arr = arr.astype(float)
+    arr = arr[np.isfinite(arr)]
+
+    if arr.size == 0:
+        return "empty"
+
+    vmin = np.min(arr)
+    vmax = np.max(arr)
+
+    if np.allclose(arr, np.round(arr)):
+        return f"[{int(round(vmin))}, {int(round(vmax))}]"
+    else:
+        return f"[{vmin:.{ndigits}f}, {vmax:.{ndigits}f}]"
 
 
+def print_movieInfo_range(name, movieInfo):
+    """
+    Print frame and coordinate ranges of a movieInfo dictionary.
+    """
+    print(f"\n[{name}]")
+    print(f"  detections: {len(movieInfo.get('frames', []))}")
+    print(f"  frames range: {_format_array_range(movieInfo.get('frames', []))}")
+    print(f"  xCoord range: {_format_array_range(movieInfo.get('xCoord', []))}")
+    print(f"  yCoord range: {_format_array_range(movieInfo.get('yCoord', []))}")
+
+    if 'zCoord' in movieInfo:
+        print(f"  zCoord range: {_format_array_range(movieInfo.get('zCoord', []))}")
+    else:
+        print("  zCoord range: not available")
 
 def tracklets_integration(
     csv_path1: str,
@@ -52,27 +93,51 @@ def tracklets_integration(
     # Step 1: Read tracking data
     print("\nStep 1: Reading tracking data...W")
     start_time = time.time()
-    if mode == 'temporal':
-        movieInfo1 = csv2movieInfo(csv_path1,img_shape,seg_indice)
-        print(f"  Tracklet 1: {len(movieInfo1['xCoord'])} detections")
+    # if mode == 'temporal':
+    #     movieInfo1 = csv2movieInfo(csv_path1,img_shape,seg_indice)
+    #     print(f"  Tracklet 1: {len(movieInfo1['xCoord'])} detections")
 
-        movieInfo2 = csv2movieInfo(csv_path2,img_shape,seg_indice)
-        print(f"  Tracklet 2: {len(movieInfo2['xCoord'])} detections")
+    #     movieInfo2 = csv2movieInfo(csv_path2,img_shape,seg_indice)
+    #     print(f"  Tracklet 2: {len(movieInfo2['xCoord'])} detections")
 
-    elif mode =='spatial':
-        movieInfo1 = csv2movieInfo(csv_path1,img_shape1,seg_indice)
-        print(f"  Tracklet 1: {len(movieInfo1['xCoord'])} detections")
+    # elif mode =='spatial':
+    #     movieInfo1 = csv2movieInfo(csv_path1,img_shape1,seg_indice)
+    #     print(f"  Tracklet 1: {len(movieInfo1['xCoord'])} detections")
 
-        movieInfo2 = csv2movieInfo(csv_path2,img_shape2,seg_indice)
-        print(f"  Tracklet 2: {len(movieInfo2['xCoord'])} detections")
+    #     movieInfo2 = csv2movieInfo(csv_path2,img_shape2,seg_indice)
+    #     print(f"  Tracklet 2: {len(movieInfo2['xCoord'])} detections")
 
+    # movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/space/movieInfo_space1.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/space/movieInfo_space1.pkl', img_shape1)
+    # movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/space/movieInfo_space2.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/space/movieInfo_space2.pkl', img_shape2)
+    # movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/time/movieInfo_0_59.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/time/movieInfo_0_59.pkl', img_shape)
+    # movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/time/movieInfo_40_109.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH1/time/movieInfo_40_109.pkl', img_shape)
+    # movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/space/movieInfo_space1.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/space/movieInfo_space1.pkl', img_shape1)
+    # movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/space/movieInfo_space2.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/space/movieInfo_space2.pkl', img_shape2)
+    # movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/time/movieInfo_300_359.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/time/movieInfo_300_359.pkl', img_shape1)
+    # movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/time/movieInfo_340_399.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/FISH2/time/movieInfo_340_399.pkl', img_shape2)
+    # movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/time/movieInfo_0_49.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/time/movieInfo_0_49.pkl', img_shape)
+    # movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/time/movieInfo_30_79.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/time/movieInfo_30_79.pkl', img_shape)
+    movieInfo1 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/space/movieInfo_space1.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/space/movieInfo_space1.pkl', img_shape1)
+    movieInfo2 = tif2mantrack.matlab_struct_to_python_dict(r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/space/movieInfo_space2.mat', r'/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/INTACT_experiments/TRIF/space/movieInfo_space2.pkl', img_shape2)
+    print_movieInfo_range("movieInfo1 after reading", movieInfo1)
+    print_movieInfo_range("movieInfo2 after reading", movieInfo2)
     end_time = time.time()
     print(f"  Reading time: {end_time - start_time:.2f} seconds")
 
     # Step2: Select common cells based on temporal or spatial overlap
     print("\nStep 2: Selecting common cells...")
     start_time = time.time()
-    crop_size = img_shape
+    # crop_size = img_shape
+
+    if mode == 'temporal':
+        if img_shape is not None:
+            crop_size = img_shape
+        elif img_shape1 is not None:
+            crop_size = img_shape1
+        else:
+            raise ValueError("temporal mode needs img_shape or img_shape1")
+    else:
+        crop_size = img_shape
 
     if mode == 'temporal':
         movieInfo1_partial, movieInfo2_partial, idmap1, idmap2, keep_parent_idx, crop_area, tm_shift, movieInfo1, movieInfo2 = select_common(movieInfo1, movieInfo2, mode, temporal_shift, img_shape)
@@ -86,6 +151,8 @@ def tracklets_integration(
         movieInfo1_partial = movieInfo1
         movieInfo2_partial = movieInfo2
 
+    print_movieInfo_range("movieInfo1_partial after reading", movieInfo1_partial)
+    print_movieInfo_range("movieInfo2_partial after reading", movieInfo2_partial)
     end_time = time.time()
     print(f"  Selection time: {end_time - start_time:.2f} seconds")
 
@@ -102,6 +169,7 @@ def tracklets_integration(
     print(f"  Matching time: {end_time - start_time:.2f} seconds")
     
     if solver == 'gurobi' or solver == 'pulp' or solver == 'cplex':
+        t_step45 = time.perf_counter()
         # Step 4: Build candidate fusion graph
         print("\nStep 4: Building candidate fusion graph...")
         start_time = time.time()
@@ -129,7 +197,8 @@ def tracklets_integration(
         print(f"  Selected edges: {np.sum(solution['edge_selection'])}")
         end_time = time.time()
         print(f"  Solving time: {end_time - start_time:.2f} seconds")
-
+        step45_time = time.perf_counter() - t_step45
+        print(f"\n[Step 4&5] total_time_sec = {step45_time:.4f}")
         # Step 6: Create fused movieInfo
         print("\nStep 6: Creating fused tracklet...")
         start_time = time.time()
@@ -143,13 +212,15 @@ def tracklets_integration(
         end_time = time.time()
         print(f"  Fusion time: {end_time - start_time:.2f} seconds")
     elif solver == 'bb':
+        t_step45 = time.perf_counter()
         # Step 4: Solve fusion
         print("\nStep 4 & 5: Solving fusion...")
         start_time = time.time()
-        tracks = bb.solve_fusion(movieInfo1_partial, movieInfo2_partial, matches)
+        tracks = bb.solve_fusion_v2(movieInfo1_partial, movieInfo2_partial, matches)
         end_time = time.time()
         print(f"  Fusion time: {end_time - start_time:.2f} seconds")
-
+        step45_time = time.perf_counter() - t_step45
+        print(f"\n[Step 4&5] total_time_sec = {step45_time:.4f}")
         # Step 6: Create fused movieInfo
         print("\nStep 6: Creating fused tracklet...")
         start_time = time.time()
@@ -821,66 +892,178 @@ def sort_movieinfo_by_frames(movieInfo):
     
     return sorted_movieInfo, old_to_new_id_map
 
+# def movieInfo2refine_res(movieInfo, crop_size):
+#     """
+#     Convert movieInfo to refine_res format.
+    
+#     Parameters:
+#     -----------
+#     movieInfo : dict
+#         Dictionary containing:
+#         - 'frames': list of frame indices for each cell
+#         - 'vox': list of n×3 arrays containing zyx coordinates for each cell
+#     crop_size : tuple
+#         Size of the crop array (z, y, x)
+    
+#     Returns:
+#     --------
+#     refine_res : list
+#         List of 3D arrays with cell labels
+#     movieInfo : dict
+#         Updated dictionary with 'perframe' key containing cell counts per frame
+#     """
+    
+#     # Calculate frame range
+#     min_frame = min(movieInfo['frames'])
+#     max_frame = max(movieInfo['frames'])
+#     num_frames = int(max_frame - min_frame + 1)
+    
+#     # Initialize refine_res as a list of zero arrays
+#     refine_res = [np.zeros(tuple(crop_size), dtype=np.int16) for _ in range(num_frames)]
+    
+#     # start_time = time.time()
+#     current_frame_label = 1
+#     prev_frame = None
+
+#     for i, frame in enumerate(movieInfo['frames']):
+#         frame_idx = int(frame - min_frame)
+#         vox = movieInfo['vox'][i]
+        
+#         # Check if frame has changed, if so, reset the label
+#         if frame != prev_frame:
+#             current_frame_label = 1
+#             prev_frame = frame
+
+#         # Get the voxel coordinates (z, y, x)
+#         vox_arr = np.array(vox)
+#         valid_mask = np.all((vox_arr >= 0) & (vox_arr < np.array(crop_size)), axis=1)
+#         if sum(valid_mask) != len(vox):
+#             print(f"Warning: {sum(valid_mask)} valid voxels for cell {i}, expected {len(vox)}")
+#         # Convert (z, y, x) to linear index for batch assignment
+#         indices = np.ravel_multi_index(vox_arr.T, crop_size)  # T for transpose
+        
+#         # Assign the labels in bulk (without looping over voxels individually)
+#         refine_res[frame_idx].flat[indices] = current_frame_label
+
+#         # Increment label for the next voxel
+#         current_frame_label += 1
+#     # end_time = time.time()
+#     # print(f"Time taken for optimized label assignment: {end_time - start_time:.2f} seconds")
+
+#     movieInfo['perframe'] = [np.max(cell_id) for cell_id in refine_res]
+    
+#     return refine_res, movieInfo
+
 def movieInfo2refine_res(movieInfo, crop_size):
     """
     Convert movieInfo to refine_res format.
-    
-    Parameters:
-    -----------
-    movieInfo : dict
-        Dictionary containing:
-        - 'frames': list of frame indices for each cell
-        - 'vox': list of n×3 arrays containing zyx coordinates for each cell
-    crop_size : tuple
-        Size of the crop array (z, y, x)
-    
-    Returns:
-    --------
-    refine_res : list
-        List of 3D arrays with cell labels
-    movieInfo : dict
-        Updated dictionary with 'perframe' key containing cell counts per frame
+    movieInfo['vox'][i] should be voxel coordinates:
+      3D: (N, 3), order = (z, y, x)
+      2D: (N, 2), order = (y, x)
     """
-    
-    # Calculate frame range
-    min_frame = min(movieInfo['frames'])
-    max_frame = max(movieInfo['frames'])
+
+    crop_size = tuple(int(v) for v in crop_size)
+    ndim = len(crop_size)
+
+    min_frame = int(np.min(movieInfo['frames']))
+    max_frame = int(np.max(movieInfo['frames']))
     num_frames = int(max_frame - min_frame + 1)
-    
-    # Initialize refine_res as a list of zero arrays
-    refine_res = [np.zeros(tuple(crop_size), dtype=np.int16) for _ in range(num_frames)]
-    
-    # start_time = time.time()
+
+    refine_res = [
+        np.zeros(crop_size, dtype=np.int16)
+        for _ in range(num_frames)
+    ]
+
     current_frame_label = 1
     prev_frame = None
+    perframe = []
 
     for i, frame in enumerate(movieInfo['frames']):
-        frame_idx = int(frame - min_frame)
-        vox = movieInfo['vox'][i]
-        
-        # Check if frame has changed, if so, reset the label
+        frame = int(frame)
+        frame_idx = frame - min_frame
+
         if frame != prev_frame:
             current_frame_label = 1
             prev_frame = frame
+            perframe.append(0)
 
-        # Get the voxel coordinates (z, y, x)
-        vox_arr = np.array(vox)
-        valid_mask = np.all((vox_arr >= 0) & (vox_arr < np.array(crop_size)), axis=1)
-        if sum(valid_mask) != len(vox):
-            print(f"Warning: {sum(valid_mask)} valid voxels for cell {i}, expected {len(vox)}")
-        # Convert (z, y, x) to linear index for batch assignment
-        indices = np.ravel_multi_index(vox_arr.T, crop_size)  # T for transpose
-        
-        # Assign the labels in bulk (without looping over voxels individually)
+        vox = movieInfo['vox'][i]
+        vox_arr = np.asarray(vox)
+
+        # 空细胞直接跳过
+        if vox_arr.size == 0:
+            current_frame_label += 1
+            perframe[-1] = max(perframe[-1], current_frame_label - 1)
+            continue
+
+        # 处理 MATLAB 可能读成 object / cell / list 的情况
+        vox_arr = np.asarray(vox_arr, dtype=np.float64)
+
+        # squeeze 掉多余维度
+        vox_arr = np.squeeze(vox_arr)
+
+        # 保证形状是 (N, ndim)
+        if vox_arr.ndim == 1:
+            # 如果是一维，说明可能不是坐标，而是 flat index，这种要单独处理
+            raise ValueError(
+                f"cell {i}: vox is 1D with shape {vox_arr.shape}. "
+                f"It looks like flat voxel indices, not coordinate array. "
+                f"You need to convert voxIdx to (z,y,x) first."
+            )
+
+        # MATLAB 有时可能是 (3, N)，需要转成 (N, 3)
+        if vox_arr.shape[0] == ndim and vox_arr.shape[1] != ndim:
+            vox_arr = vox_arr.T
+
+        if vox_arr.ndim != 2 or vox_arr.shape[1] != ndim:
+            raise ValueError(
+                f"cell {i}: invalid vox shape {vox_arr.shape}, "
+                f"expected (N,{ndim}) for crop_size={crop_size}"
+            )
+
+        # 检查是否接近整数。vox 坐标理论上必须是整数
+        if not np.all(np.isfinite(vox_arr)):
+            raise ValueError(f"cell {i}: vox contains NaN or Inf")
+
+        if not np.allclose(vox_arr, np.round(vox_arr), atol=1e-6):
+            raise ValueError(
+                f"cell {i}: vox contains non-integer coordinates, "
+                f"example={vox_arr[:5]}"
+            )
+
+        vox_arr = np.round(vox_arr).astype(np.int64)
+
+        # 过滤越界点。你原来只是算了 valid_mask，但没有用它过滤
+        valid_mask = np.all(
+            (vox_arr >= 0) & (vox_arr < np.array(crop_size, dtype=np.int64)),
+            axis=1
+        )
+
+        if np.sum(valid_mask) != len(vox_arr):
+            print(
+                f"Warning: {np.sum(valid_mask)} valid voxels for cell {i}, "
+                f"expected {len(vox_arr)}"
+            )
+
+        vox_arr = vox_arr[valid_mask]
+
+        if vox_arr.size == 0:
+            current_frame_label += 1
+            perframe[-1] = max(perframe[-1], current_frame_label - 1)
+            continue
+
+        indices = np.ravel_multi_index(vox_arr.T, crop_size)
         refine_res[frame_idx].flat[indices] = current_frame_label
 
-        # Increment label for the next voxel
+        perframe[-1] = max(perframe[-1], current_frame_label)
         current_frame_label += 1
-    # end_time = time.time()
-    # print(f"Time taken for optimized label assignment: {end_time - start_time:.2f} seconds")
 
-    movieInfo['perframe'] = [np.max(cell_id) for cell_id in refine_res]
-    
+    # 更稳：不要用 np.max(cell_id) 推 perframe，因为 label 可能因为空细胞跳过
+    movieInfo['perframe'] = [
+        int(np.max(cell_id)) if cell_id.size > 0 else 0
+        for cell_id in refine_res
+    ]
+
     return refine_res, movieInfo
 
 def _get_extended_cell_set(movieInfo: Dict, base_cells: Set[int]) -> Set[int]:
