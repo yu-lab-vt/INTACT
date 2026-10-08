@@ -50,6 +50,11 @@ The input CSV files **must** contain the following columns:
 - `parents`: parent ID (typically an integer, may be -1/NaN for no parent)
 - `voxIdx`: flattened segmentation index of the cell (format controlled by `seg_indice`)
 
+
+### Experiments
+Test data can be downloaded at https://cloud.tsinghua.edu.cn/d/0c666b6b80394446a22b/.
+
+
 ## Dependencies
 
 - Python 3.7+
